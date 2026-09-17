@@ -504,6 +504,42 @@ class MlxLmBackend(Backend):
                 # 并静默回落到原生 exact 路径 —— 等于拒绝采样从未真正生效，
                 # 而 /stats 里只看得到一个含糊的 disabled_reason。
                 round_stats: List[dict] = []
+                # ⚠️ 中文乱码（�）的根因与修法 ----------------------------
+                # Llama 的 byte-level BPE 词表里存在**字节碎片** token，例如
+                # id=33443 单独 decode 得到 U+FFFD（�）。它只是某个中文字符
+                # UTF-8 编码的一部分，必须与**相邻** token 的字节拼起来才是
+                # 完整字符。
+                #
+                # 实测（2026-09-17，id 序列 [116685,112086,248,45826,106,33443]）：
+                #     decode(all)  = '浩瀚壮�'      ← 整段解码**仍**会带 �
+                #     逐 token 拼接 = '浩�����'      ← 更糟
+                # 因为 33443 是个**落单的**字节片段：前面的 token 已构成完整
+                # 字符，它没有可配对的邻居。整段解码并不能救它。
+                #
+                # 所以正确的修法是**暂扣不完整的尾部**：
+                #   · 保留已产出的 token id，每次解码整个序列；
+                #   · 若解码结果以 U+FFFD 结尾，说明末尾字节还不完整（也可能
+                #     它永远补不齐），此时**先不交付**这一小段；
+                #   · 等后续 token 到来再一起解码——若补上了就正常交付，
+                #     始终补不齐则这一两个字节被丢弃。
+                # 效果：宁可少一两个字节，也不把 � 写给用户。
+                # 这与 mlx_lm 原生路径的 detokenizer 行为一致（它也做增量
+                # 拼接），但原生路径同样会在落单字节上吐出 �，因此这里更严。
+                gen_ids: List[int] = []
+
+                def _text_of(all_ids: List[int]) -> str:
+                    """解码整个已生成序列。
+
+                    返回值可能以 U+FFFD 结尾 —— 调用方负责暂扣（见上）。
+                    """
+                    try:
+                        return self.tokenizer.decode(all_ids)
+                    except Exception:
+                        # 极端情况下退回逐 token 拼接，至少不中断生成
+                        return "".join(self.tokenizer.decode([i]) for i in all_ids)
+
+
+
                 for tid, _ in stream_rejection(
                     self.model, self.draft_model, feed_ids, cap,
                     float(opts.temperature), nd,
@@ -518,7 +554,11 @@ class MlxLmBackend(Backend):
                     if tid in eos_ids:
                         finish = "stop"
                         break
-                    buf += self.tokenizer.decode([tid])
+                    gen_ids.append(int(tid))
+                    # _stable_prefix 会暂扣末尾尚未拼齐的字节（见上面的说明）。
+                    # 交付长度按**稳定前缀**算，因此不完整的尾巴永远不会被
+                    # 当作已产出内容发出去。
+                    buf = _stable_prefix(_text_of(gen_ids))
                     safe = len(buf) - (stop_hold - 1 if stop_hold else 0)
                     if safe > emitted:
                         yield _mark(buf[emitted:safe])
@@ -545,7 +585,9 @@ class MlxLmBackend(Backend):
                     if opts.abort is not None and opts.abort.is_set():
                         finish = "aborted"
                         break
-                    buf += resp.text
+                    # resp.text 来自 mlx_lm 的 detokenizer，同样的落单字节
+                    # 问题它也存在，故一并暂扣尾部（见 _stable_prefix）。
+                    buf = _stable_prefix(buf + resp.text)
                     safe = len(buf) - (stop_hold - 1 if stop_hold else 0)
                     if safe > emitted:
                         yield _mark(buf[emitted:safe])
@@ -562,7 +604,9 @@ class MlxLmBackend(Backend):
                 if opts.abort is not None and opts.abort.is_set():
                     finish = "aborted"
                     break
-                buf += resp.text
+                # resp.text 来自 mlx_lm 的 detokenizer，落单字节问题同样存在，
+                # 故一并暂扣尾部（见 _stable_prefix）。
+                buf = _stable_prefix(buf + resp.text)
                 # 留 stop_hold-1 字符在缓冲里跨块匹配 stop 串
                 safe = len(buf) - (stop_hold - 1 if stop_hold else 0)
                 if safe > emitted:
@@ -575,7 +619,10 @@ class MlxLmBackend(Backend):
         if opts.abort is not None and opts.abort.is_set():
             finish = "aborted"
         # flush 残余；若命中 stop 串则截断
-        tail = buf[emitted:]
+        # ⚠️ 这里的 buf 已是稳定前缀（末尾不完整字节在生成循环里被暂扣）。
+        # 但若生成是**因错误跳出**而 buf 仍是原始值，仍要兜一道，
+        # 保证任何路径都不会把 U+FFFD 交付给用户。
+        tail = _stable_prefix(buf)[emitted:]
         cut = None
         for s in stops:
             i = tail.find(s)
@@ -769,6 +816,24 @@ def _normalize_ids(tok, text: str) -> list:
         ids = ids[1:]
     return ids
 
+
+
+def _stable_prefix(s: str) -> str:
+    """去掉末尾不完整的字节（表现为连续的 U+FFFD）。
+
+    为什么需要它（2026-09-17 实测定位）：Llama 的 byte-level BPE 词表里有
+    **落单的字节碎片** token，例如 id=33443 单独 decode 就是 U+FFFD。序列
+    [116685,112086,248,45826,106,33443] 整段解码得到 '浩瀚壮�' —— 即 33443
+    没有可配对的邻居，解码器只能吐 �。
+
+    逐 token 拼接更糟（'浩�����'）。唯一可靠的办法是**暂扣尾部**：如果解码
+    结果以 U+FFFD 结尾，就先不交付这一段，等后续 token 到来再一起解码；
+    若始终补不齐，这一两个字节被丢弃。
+
+    取舍：宁可少一两个字节，也不把 � 写给用户。中间的 �（模型真产出的非法
+    字节）不做处理 —— 那不是拼接问题，无从恢复。
+    """
+    return s.rstrip("\ufffd")
 
 def _flatten_message(m: dict) -> dict:
     """OpenAI message 兼容：content 可为 str 或 content parts 数组。
