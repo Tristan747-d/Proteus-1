@@ -215,9 +215,14 @@ gm/                    gateway (Python, stdlib HTTP + mlx-lm in-process)
 ProteusStudio/         macOS app (SwiftUI)
   Sources/
 project.yml            xcodegen manifest
+Info.plist             app metadata (explicit; icon key needs it)
+AppIcon-source.png     icon source (1254x1254); run ./make-icon.sh
+AppIcon.icns           generated icon (do not edit by hand)
 models.json.template   config template (paths are placeholders)
 install.sh             one-shot setup
 proteus                service CLI (startup/stop/status/logs/doctor)
+make-icon.sh           rebuild AppIcon.icns from the source PNG
+rebuild-app.sh         rebuild + install the app
 tools/
   gw_bench.py          gateway benchmark with host-state guard
 docs/                  the research record
