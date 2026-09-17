@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  为什么手写这份 Info.plist，而不是用 GENERATE_INFOPLIST_FILE=YES：
+
+	  实测（2026-09-17）：自动生成模式下，Xcode 只处理 INFOPLIST_KEY_* 系列
+	  设置，而它**不认** INFOPLIST_KEY_CFBundleIconFile —— 生成的 plist 里
+	  既没有 CFBundleIconFile，也不报错，图标因此静默失效（.icns 明明已经
+	  作为资源打进了 bundle）。也试过不带前缀的 CFBundleIconFile 构建设置，
+	  同样无效。
+
+	  改为提供显式 Info.plist，图标键就一定能写进去。代价是原本由
+	  INFOPLIST_KEY_* 提供的键要在这里手写一遍 —— 已全部补齐，见下。
+	-->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Proteus Studio</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+
+	<!-- 应用图标：由 ./make-icon.sh 从 AppIcon-source.png 生成 -->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Tristan</string>
+
+	<!-- 网关只监听 127.0.0.1，但仍需声明允许本地网络，否则 ATS 会拦 -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

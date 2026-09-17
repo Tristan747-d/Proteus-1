@@ -12,6 +12,11 @@ targets:
     platform: macOS
     sources:
       - Sources
+      # AppIcon.icns 必须作为**资源**打进 bundle，否则 CFBundleIconFile
+      # 指向的文件不在 .app 里，Finder/Dock 会回落到默认图标。
+      # （AppIcon-source.png 是生成它的原始图，不需要打包。）
+      - path: AppIcon.icns
+        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: Proteus Studio
@@ -20,9 +25,9 @@ targets:
         SWIFT_VERSION: "5.10"
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: "NO"
-        GENERATE_INFOPLIST_FILE: "YES"
-        INFOPLIST_KEY_CFBundleDisplayName: Proteus Studio
-        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.developer-tools"
-        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: "YES"
-        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Tristan"
+        # 用显式 Info.plist（见该文件里的说明）：自动生成模式无法写入
+        # CFBundleIconFile，图标会静默失效。
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: Info.plist
+        # 应用图标由 Info.plist 的 CFBundleIconFile 声明（见该文件）。
         COMBINE_HIDPI_IMAGES: "YES"
