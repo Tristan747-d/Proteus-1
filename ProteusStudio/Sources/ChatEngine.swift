@@ -144,7 +144,7 @@ final class ChatEngine: ObservableObject {
                         case NSURLErrorCannotConnectToHost,
                              NSURLErrorNetworkConnectionLost,
                              NSURLErrorTimedOut:
-                            hint = "无法连接网关（127.0.0.1:8320）。"
+                            hint = "无法连接网关（\(GatewayLocator.displayAddress())）。"
                                 + "请在终端运行 proteus startup，或用「网关 → 重启网关」。"
                         default:
                             hint = desc

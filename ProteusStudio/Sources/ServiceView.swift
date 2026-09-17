@@ -6,7 +6,8 @@ struct ServiceView: View {
     @EnvironmentObject var store: AppStore
     @State private var copied: String?
 
-    private let base = "http://127.0.0.1:8320"
+    // 跟随 models.json 的 server.port，不写死。
+    private var base: String { store.gateway.baseURLString }
 
     var body: some View {
         ScrollView {

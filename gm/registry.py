@@ -3,6 +3,7 @@
 models.json 结构（加模型=加一项，不改代码）：
 {
   "server": {"host": "127.0.0.1", "port": 8320, "max_resident": 1},
+  // port 只是默认值，可改。它是端口的唯一真相源：CLI、GUI、bench 都读这里。
   "models": [
     {
       "name": "llama-3.1-8b-4bit",

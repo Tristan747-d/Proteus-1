@@ -175,7 +175,7 @@ struct GatewayBadge: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(store.gatewayAlive ? "网关在线" : "网关离线")
                     .font(.system(size: 11, weight: .medium))
-                Text("127.0.0.1:8320")
+                Text(GatewayLocator.displayAddress())
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
             }

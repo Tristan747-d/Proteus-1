@@ -81,10 +81,35 @@ proteus startup
 | `proteus restart` | Restart the service |
 | `proteus status` | Service state, available models, loaded model, recent request |
 | `proteus logs [-f]` | Show (or follow) the gateway log |
+| `proteus port [N]` | Show or change the gateway port (prompts to restart) |
 | `proteus gui` | Open the app only |
 | `proteus doctor` | Environment self-check (interpreter, model paths, plist) |
 | `proteus install [--adopt]` | Install/refresh the launchd service |
 | `proteus uninstall` | Remove the launchd service |
+
+### Changing the port
+
+Port **8320** is the default, not a constant. `models.json` → `server.port`
+is the single source of truth; the CLI, the app and `tools/gw_bench.py` all
+read it from there, so there is no second copy to drift out of sync.
+
+```bash
+proteus port              # show the current port and where it came from
+proteus port 9000         # change it (validates + checks availability)
+                          # then offers to restart the gateway
+```
+
+A port change does **not** take effect until the gateway restarts, since the
+running process still holds the old socket — `proteus port` prompts for it
+rather than leaving you with a gateway on a port you no longer expect. The app
+re-reads `models.json` on launch, so it follows automatically; no GUI setting
+to update.
+
+Changing the port at install time:
+
+```bash
+PROTEUS_PORT=9000 ./install.sh
+```
 
 The gateway runs as a **launchd** service, so `KeepAlive` restarts it if it
 crashes, and it starts at login. `proteus install` refuses to silently
@@ -94,7 +119,7 @@ switch deliberately.
 **Connect any agent client**
 
 ```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8320/v1"
+export OPENAI_BASE_URL="http://127.0.0.1:8320/v1"   # check `proteus port` if you changed it
 export OPENAI_API_KEY="local"      # the gateway is local-only; no key check
 ```
 

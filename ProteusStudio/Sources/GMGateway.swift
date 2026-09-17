@@ -1,5 +1,71 @@
 import Foundation
 
+/// 网关地址解析 —— 端口的唯一真相源是 `models.json` 的 `server.port`。
+///
+/// 为什么不让 GUI 自己存一份端口：用户可能同时用 CLI（`proteus port 9000`）
+/// 或手改 models.json。GUI 里若再存一份，两边就会分叉 —— 表现为「CLI 说在线、
+/// GUI 说离线」，而且用户完全看不出为什么。
+///
+/// 因此每次启动都重新读文件，与 `proteus` CLI 用同一份来源。
+enum GatewayLocator {
+    /// 候选配置目录，按优先级排列。
+    ///
+    /// 第一项来自 launchd plist 的 WorkingDirectory —— 那是**实际在跑**的
+    /// 服务目录，权威性最高。其余是常见安装位置。
+    static func candidateDirs() -> [String] {
+        var out: [String] = []
+        let home = NSHomeDirectory()
+        let plist = home + "/Library/LaunchAgents/com.tristan.gm.gateway.plist"
+        if let d = FileManager.default.contents(atPath: plist),
+           let s = String(data: d, encoding: .utf8),
+           let r = s.range(of: "<key>WorkingDirectory</key>") {
+            let tail = s[r.upperBound...]
+            if let a = tail.range(of: "<string>"),
+               let b = tail.range(of: "</string>", range: a.upperBound..<tail.endIndex) {
+                let v = String(tail[a.upperBound..<b.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if v.hasPrefix("/") { out.append(v) }
+            }
+        }
+        out.append(home + "/Proteus-Release")
+        out.append(home + "/GeneralModel")
+        out.append(Bundle.main.bundleURL.deletingLastPathComponent().path)
+        return out
+    }
+
+    /// 解析出的 (host, port, 配置路径)。找不到配置时回落到 127.0.0.1:8320。
+    static func resolve() -> (host: String, port: Int, configPath: String?) {
+        for dir in candidateDirs() {
+            let p = dir + "/models.json"
+            guard let data = FileManager.default.contents(atPath: p),
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let srv = obj["server"] as? [String: Any] else { continue }
+            let host = (srv["host"] as? String) ?? "127.0.0.1"
+            // port 可能是 Int 也可能是 NSNumber
+            let port = (srv["port"] as? Int)
+                ?? (srv["port"] as? NSNumber)?.intValue
+                ?? 8320
+            if port > 0 && port <= 65535 {
+                return (host, port, p)
+            }
+        }
+        return ("127.0.0.1", 8320, nil)
+    }
+
+    static func baseURL() -> URL {
+        let r = resolve()
+        return URL(string: "http://\(r.host):\(r.port)")!
+            ?? URL(string: "http://127.0.0.1:8320")!
+    }
+
+    /// 供界面展示的可读地址。
+    static func displayAddress() -> String {
+        let r = resolve()
+        return "\(r.host):\(r.port)"
+    }
+}
+
 /// 网关的一条模型条目，含它绑定的权重与运行时参数。
 ///
 /// 注意 `weight` 与 `id` 的区别：`id` 是发给网关的 model 字段（一个运行配置），
@@ -34,8 +100,13 @@ struct ModelEntryInfo: Identifiable, Hashable {
 actor GMGateway {
     let base: URL
 
-    init(base: URL = URL(string: "http://127.0.0.1:8320")!) {
-        self.base = base
+    init(base: URL? = nil) {
+        self.base = base ?? GatewayLocator.baseURL()
+    }
+
+    /// 供界面展示/拼接端点用的地址字符串（跟随 models.json 的端口）。
+    nonisolated var baseURLString: String {
+        base.absoluteString
     }
 
     private var session: URLSession {

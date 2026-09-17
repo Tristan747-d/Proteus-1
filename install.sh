@@ -86,6 +86,22 @@ ok "目标模型: $MODEL_DIR"
 DRAFT="${PROTEUS_DRAFT:-mlx-community/Llama-3.2-1B-Instruct-4bit}"
 ok "草稿模型: $DRAFT"
 
+# ---------------------------------------------------------------- 端口
+PORT="${PROTEUS_PORT:-8320}"
+case "$PORT" in
+  ''|*[!0-9]*) die "PROTEUS_PORT 必须是数字: $PORT" ;;
+esac
+if [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
+  die "PROTEUS_PORT 需在 1024–65535 之间（<1024 需要 root）"
+fi
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  warn "端口 $PORT 已被占用："
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sed -n '2,3p' | sed 's/^/      /'
+  warn "继续安装，但网关可能起不来；之后可用 proteus port <N> 换端口"
+else
+  ok "网关端口: $PORT"
+fi
+
 # ---------------------------------------------------------------- 生成配置
 say "生成 models.json"
 
@@ -94,6 +110,7 @@ if [ -f models.json ] && [ "$FORCE" -eq 0 ]; then
 else
   sed -e "s|@MODEL_DIR@|$MODEL_DIR|g" \
       -e "s|@DRAFT_MODEL@|$DRAFT|g" \
+      -e "s|@PORT@|$PORT|g" \
       models.json.template > models.json
   ok "已生成 models.json"
 fi

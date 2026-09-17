@@ -7,6 +7,7 @@
 #   proteus restart          重启服务
 #   proteus status           查看服务与模型状态
 #   proteus logs [-f]        查看网关日志
+#   proteus port [N]         查看或修改网关端口（改后引导重启）
 #   proteus gui              只打开 GUI
 #   proteus install          安装/更新 launchd 服务（幂等）
 #   proteus uninstall        移除 launchd 服务
@@ -203,19 +204,180 @@ assert_install_safe() {
   fi
 }
 
-gw_alive() {
-  curl -fsS -m 3 "http://127.0.0.1:8320/healthz" >/dev/null 2>&1
+# ---------------------------------------------------------------- 配置/端口
+#
+# 端口的**唯一真相源**是 models.json 的 server.port。CLI 不缓存、不另存一份，
+# 每次都从文件读 —— 这样用户手改 models.json 或 GUI 改了之后，CLI 立刻跟上，
+# 不会出现「配置文件说 9000、CLI 还去探 8320」的分叉。
+CONFIG_DIR=""
+CONFIG_PATH=""
+
+# 找到含 models.json 的目录：优先 launchd plist 记的 WorkingDirectory，
+# 其次脚本所在仓库，最后常见位置。
+resolve_config() {
+  [ -n "$CONFIG_PATH" ] && return 0
+  local d=""
+  local wd
+  wd="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+        | awk -F'= ' '/working directory = /{print $2; exit}' || true)"
+  wd="$(printf '%s' "$wd" | xargs 2>/dev/null || true)"
+  if [ -n "$wd" ] && [ -f "$wd/models.json" ]; then
+    d="$wd"
+  elif [ -f "$HERE/models.json" ]; then
+    d="$HERE"
+  elif [ -f "$HOME/Proteus-Release/models.json" ]; then
+    d="$HOME/Proteus-Release"
+  elif [ -f "$HOME/GeneralModel/models.json" ]; then
+    d="$HOME/GeneralModel"
+  fi
+  CONFIG_DIR="$d"
+  CONFIG_PATH="$d/models.json"
 }
 
+# 读端口；读不到就回落到 8320（并让调用方知道是回落值）。
 gw_port() {
-  local cfg="$1"
-  python3 - "$cfg" <<'PY' 2>/dev/null || echo 8320
-import json,sys
+  resolve_config
+  local p=""
+  if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+    p="$(python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
+import json, sys
 try:
-    print(json.load(open(sys.argv[1]))["server"].get("port",8320))
+    print(json.load(open(sys.argv[1]))["server"].get("port", 8320))
 except Exception:
-    print(8320)
+    pass
 PY
+)"
+  fi
+  case "$p" in
+    ''|*[!0-9]*) p=8320 ;;
+  esac
+  printf '%s' "$p"
+}
+
+gw_host() {
+  resolve_config
+  local h=""
+  if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+    h="$(python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["server"].get("host", "127.0.0.1"))
+except Exception:
+    pass
+PY
+)"
+  fi
+  [ -n "$h" ] || h=127.0.0.1
+  printf '%s' "$h"
+}
+
+gw_url() { printf 'http://%s:%s' "$(gw_host)" "$(gw_port)"; }
+
+gw_alive() {
+  curl -fsS -m 3 "$(gw_url)/healthz" >/dev/null 2>&1
+}
+
+# 端口是否被**别的**进程占用（用于启动前检查）。
+port_in_use() {
+  local p="$1"
+  lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+cmd_port() {
+  local new="${1:-}"
+  resolve_config
+  [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ] \
+    || die "找不到 models.json（先运行 ./install.sh）"
+
+  local cur; cur="$(gw_port)"
+
+  if [ -z "$new" ]; then
+    say "网关端口"
+    ok "当前: $cur   （来源: ${CONFIG_PATH}）"
+    printf '    地址: %s\n' "$(gw_url)"
+    if gw_alive; then
+      ok "网关在线，监听的正是这个端口"
+    else
+      warn "网关未在线"
+    fi
+    printf '\n    改端口: proteus port <1024-65535>\n'
+    return 0
+  fi
+
+  # ---- 校验 ----
+  case "$new" in
+    ''|*[!0-9]*) die "端口必须是数字: ${new}" ;;
+  esac
+  if [ "$new" -lt 1024 ] || [ "$new" -gt 65535 ]; then
+    die "端口需在 1024–65535 之间（<1024 需要 root，本服务以普通用户运行）"
+  fi
+  if [ "$new" = "$cur" ]; then
+    ok "端口已经是 ${new}，无需改动"
+    return 0
+  fi
+  # 占用检查：若新端口已被**别的**进程监听，改了也起不来，提前拦下。
+  if port_in_use "$new"; then
+    # 唯一允许的情况：本网关其实已经在监听它（配置与实况不一致时）
+    if ! gw_alive; then
+      die "端口 $new 已被其它进程占用：
+$(lsof -nP -iTCP:"$new" -sTCP:LISTEN 2>/dev/null | sed -n '2,4p' | sed 's/^/      /')
+    换一个端口，或先停掉那个进程。"
+    fi
+  fi
+
+  # ---- 写入 models.json（保留其它字段，只改 server.port）----
+  # 先查可写性：models.json 若归 root 所有（早期用 sudo 装过就会这样），
+  # 直接写会抛 PermissionError 并打出一段 Python traceback —— 用户看不懂
+  # 也不知道怎么修。这里提前拦下并给出确切的修复命令。
+  if [ ! -w "$CONFIG_PATH" ]; then
+    local owner=""
+    owner="$(stat -f '%Su' "$CONFIG_PATH" 2>/dev/null || true)"
+    die "${CONFIG_PATH} 不可写${owner:+（归 ${owner} 所有）}
+    修复归属（执行一次即可）：
+        sudo chown \$(id -un) \"${CONFIG_PATH}\""
+  fi
+
+  if ! python3 - "$CONFIG_PATH" "$new" <<'PY'
+import json, shutil, sys, time
+cfg, port = sys.argv[1], int(sys.argv[2])
+raw = open(cfg, encoding="utf-8").read()
+data = json.loads(raw)
+data.setdefault("server", {})["port"] = port
+bak = f"{cfg}.bak.{time.strftime('%Y%m%d_%H%M%S')}"
+shutil.copy2(cfg, bak)
+open(cfg, "w", encoding="utf-8").write(
+    json.dumps(data, ensure_ascii=False, indent=2))
+print(f"备份 {bak}")
+PY
+  then
+    die "写入 ${CONFIG_PATH} 失败（详见上方错误）"
+  fi
+  ok "已写入 ${CONFIG_PATH}：${cur} → ${new}"
+
+  # ---- 引导重启（用户明确要求：改完必须提示重启才能生效）----
+  printf '\n'
+  warn "端口改动**不会自动生效** —— 网关进程持有的是旧端口。"
+  if is_loaded || gw_alive; then
+    printf '    现在重启网关使其生效吗？[y/N] '
+    local ans=""
+    read -r ans || true
+    case "$ans" in
+      y|Y|yes|YES)
+        cmd_restart
+        printf '\n'
+        if gw_alive; then
+          ok "网关已在新端口就绪: $(gw_url)"
+          cmd_gui >/dev/null 2>&1 || true
+          printf '    GUI 会自动读取新端口，无需手动配置。\n'
+        else
+          warn "重启后未就绪，查看日志: proteus logs"
+        fi
+        return 0
+        ;;
+    esac
+  fi
+  printf '    手动生效: proteus restart\n'
+  printf '    GUI 会自动跟随 models.json，无需手动改。\n'
 }
 
 # ---------------------------------------------------------------- 子命令
@@ -275,7 +437,7 @@ cmd_startup() {
   printf '    等待网关就绪'
   local i
   for i in $(seq 1 60); do
-    if gw_alive; then printf '\n'; ok "网关在线: http://127.0.0.1:8320"; break; fi
+    if gw_alive; then printf '\n'; ok "网关在线: $(gw_url)"; break; fi
     printf '.'; sleep 1
   done
   if ! gw_alive; then
@@ -345,11 +507,14 @@ cmd_status() {
     #   2. 更不能用 `curl ... | python3 - <<'PY'` —— heredoc 会占用
     #      python 的 stdin，管道数据被丢弃，json.load 读到空输入。
     # 因此让 Python 自己发请求（stdlib urllib，无额外依赖）。
-    python3 - <<'PY' 2>/dev/null || true
-import json, urllib.request
+    # BASE 通过 argv 传入，从而跟随 models.json 里的端口。
+    python3 - "$(gw_url)" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+
+BASE = sys.argv[1]
 
 def get(path):
-    with urllib.request.urlopen("http://127.0.0.1:8320" + path, timeout=5) as r:
+    with urllib.request.urlopen(BASE + path, timeout=5) as r:
         return json.loads(r.read().decode())
 
 try:
@@ -479,9 +644,10 @@ PY
   fi
 
   # 端口占用
-  if gw_alive; then ok "网关在线: http://127.0.0.1:8320"
-  elif curl -fsS -m 2 http://127.0.0.1:8320/ >/dev/null 2>&1; then warn "8320 被非本网关进程占用"
-  else ok "8320 空闲"; fi
+  local _p; _p="$(gw_port)"
+  if gw_alive; then ok "网关在线: $(gw_url)（配置端口 ${_p}）"
+  elif port_in_use "$_p"; then warn "端口 $_p 被非本网关进程占用"
+  else ok "端口 $_p 空闲"; fi
 
   printf '\n'
   [ "$bad" -eq 0 ] && ok "未发现问题" || warn "存在问题（见上）"
@@ -499,8 +665,9 @@ case "${1:-}" in
   status|st)          cmd_status ;;
   logs|log)           shift; cmd_logs "${1:-}" ;;
   gui)                cmd_gui ;;
-  install)            cmd_install ;;
+  install)            shift; cmd_install "${1:-}" ;;
   uninstall)          cmd_uninstall ;;
+  port)               shift; cmd_port "${1:-}" ;;
   doctor|check)       cmd_doctor ;;
   ""|-h|--help|help)  usage ;;
   *)                  printf '未知子命令: %s\n\n' "$1" >&2; usage; exit 1 ;;

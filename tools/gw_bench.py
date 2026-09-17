@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_HOST = "http://127.0.0.1:8320"
+DEFAULT_HOST = None   # None = 从 models.json 解析（见 resolve_host）
 OUT_DIR = Path(__file__).resolve().parent / "results"
 
 # 宿主守卫阈值（审计 §11.2）。超过即拒绝出结论。
@@ -48,6 +48,31 @@ MAX_LOAD1 = 5.0
 
 SYS = ("You are a careful technical assistant. Answer using short, concrete "
        "sentences. Prefer specific facts over generalities.")
+
+
+def resolve_host(explicit=None):
+    """解析网关地址。端口的唯一真相源是 models.json 的 server.port。
+
+    不让本脚本缓存端口：用户可能刚用 `proteus port 9000` 改过，若这里还去
+    探 8320，就会出现「CLI 说在线、bench 说连不上」的分叉。
+    """
+    if explicit:
+        return explicit
+    here = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    for d in (here, home / "Proteus-Release", home / "GeneralModel"):
+        cfg = d / "models.json"
+        if not cfg.exists():
+            continue
+        try:
+            srv = json.loads(cfg.read_text(encoding="utf-8")).get("server", {})
+            host = srv.get("host", "127.0.0.1")
+            port = int(srv.get("port", 8320))
+            if 0 < port <= 65535:
+                return f"http://{host}:{port}"
+        except Exception:
+            continue
+    return "http://127.0.0.1:8320"
 
 
 # ---------------------------------------------------------------- host state
@@ -205,6 +230,9 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="run even when the host looks dirty (results NOT conclusive)")
     args = ap.parse_args()
+
+    # 解析网关地址（跟随 models.json 的 server.port）
+    args.host = resolve_host(args.host)
 
     if args.list_models:
         print(json.dumps(list_models(args.host), indent=2))
