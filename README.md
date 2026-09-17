@@ -271,8 +271,23 @@ Be aware of what has and hasn't been verified before you rely on this:
   streaming responses.
 - ✅ `gm-probe`: verified against real tokenizers, with positive and negative
   controls.
-- ⚠️ **GUI: compiled and smoke-tested, but not visually verified.** Layout
-  issues may remain.
+- ✅ Attachments: verified against real files — a Chinese PDF, docx, Python,
+  several files at once, over-length truncation, and attachment-without-text.
+  A PNG is refused with a 400 carrying the reason.
+- ✅ Port configuration: `proteus port` and the in-app editor (range,
+  availability, write-through, restart prompt); a clean checkout installs
+  correctly with `PROTEUS_PORT`.
+- ✅ Streamed text encoding: 0 replacement characters across the Chinese
+  requests that previously produced 26 (see `_stable_prefix` in
+  `gm/backends/mlx_lm_backend.py`).
+- ⚠️ **GUI: not visually verified.** It compiles, launches, connects to the
+  gateway and exercises its features, but no screenshot has been taken in this
+  environment — screen capture needs a permission that is not granted here.
+  **Layout issues may remain.**
+- ⚠️ **Benchmark numbers are host-sensitive.** This machine is fanless and
+  subject to a reversible ~2× sustained-power collapse. `tools/gw_bench.py`
+  refuses to report when the host looks dirty, and absolute throughput is not
+  comparable across sessions.
 
 ---
 

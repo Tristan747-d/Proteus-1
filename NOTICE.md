@@ -76,6 +76,22 @@ loop and the prefix-cache implementation call `mlx_lm` primitives
 
 ---
 
+## pypdf
+
+- **License**: BSD 3-Clause License
+- **Upstream**: https://github.com/py-pdf/pypdf
+
+**How it is used.** This is an **optional** dependency, used only by the
+attachment feature (`gm/attachments.py`) to extract text from PDFs.
+
+**What this means for the release.** No pypdf code is bundled. Without it, PDF
+attachments are refused with a message telling you to install it; every other
+attachment type (text, code, CSV/JSON, docx/rtf via macOS `textutil`) keeps
+working. `install.sh` reports whether it is present. The other extraction paths
+use only the Python standard library and macOS built-ins.
+
+---
+
 ## Apple frameworks
 
 This project uses **CoreML / coremltools** (Apple) and **MLX** (Apple) as
@@ -101,6 +117,7 @@ respective publishers — see the Meta Llama license for Llama models.
 | Project | License | Relationship |
 |---|---|---|
 | **mlx-lm** | MIT | **Runtime dependency** |
+| **pypdf** | BSD 3-Clause | **Optional** — PDF attachments only |
 | MLX | MIT | Platform dependency |
 | CoreML / coremltools | Apple terms | Platform dependency |
 | **ANEForge** | MIT | Research tool — conclusions credited, **no code bundled** |
