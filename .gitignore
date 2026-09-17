@@ -12,6 +12,9 @@ models.json
 models.json.bak*
 *.local.json
 
+# ---- 测量输出（本机产物，不入库）----
+tools/results/
+
 # ---- 构建产物 ----
 ProteusStudio/*.xcodeproj/
 ProteusStudio/build/
