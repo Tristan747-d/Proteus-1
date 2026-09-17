@@ -13,6 +13,7 @@ struct ServiceView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 statusCard
+                portCard
                 endpointsCard
                 clientCard
                 limitsCard
@@ -23,6 +24,71 @@ struct ServiceView: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .task { await store.refresh() }
+    }
+
+    // MARK: 端口
+
+    /// 端口卡片：显示当前端口与来源，并允许就地修改。
+    ///
+    /// 端口是 models.json 的 server.port，是**唯一真相源**。界面不另存一份，
+    /// 所以这里显示的就是网关真正会用的值 —— 不会出现「界面说 9000、网关在
+    /// 8320」的分叉。
+    private var portCard: some View {
+        Card(title: "端口", step: "⇄") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Text("\(store.configuredPort)")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                    Text(store.stats.alive ? "监听中" : "未监听")
+                        .font(.system(size: 11))
+                        .foregroundStyle(store.stats.alive ? Color.green : .secondary)
+                    Spacer()
+                    Button(store.portEditing ? "取消" : "修改端口") {
+                        store.portEditing.toggle()
+                        store.portMessage = nil
+                    }
+                    .controlSize(.small)
+                }
+
+                // 来源：让用户知道改的是哪个文件（多份安装时尤其重要）
+                if let p = store.configPath {
+                    Text("来自 \(p.replacingOccurrences(of: NSHomeDirectory(), with: "~"))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                if store.portEditing {
+                    PortEditor()
+                }
+
+                if let msg = store.portMessage {
+                    let bad = msg.contains("失败") || msg.contains("不可写")
+                        || msg.contains("找不到") || msg.contains("需在")
+                    HStack(spacing: 7) {
+                        Image(systemName: bad ? "exclamationmark.triangle.fill"
+                                              : "info.circle.fill")
+                        Text(msg).font(.system(size: 11))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    .foregroundStyle(bad ? Color.orange : .secondary)
+                    .padding(8)
+                    .background {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.primary.opacity(0.045))
+                    }
+                } else {
+                    Text("端口写在 models.json 的 server.port。"
+                         + "改动后需重启网关才会生效 —— 网关进程持有的是旧端口。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 
     // MARK: 状态
@@ -223,6 +289,83 @@ struct ServiceView: View {
         copied = tag
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             if copied == tag { copied = nil }
+        }
+    }
+}
+
+// MARK: - 端口编辑
+
+/// 端口编辑行：输入 + 保存 + 保存后的一键重启。
+///
+/// 为什么保存后要单独给一个「重启网关」按钮，而不是自动重启：改端口会让
+/// 正在进行的请求中断。自动重启等于替用户做了「现在可以断」的决定 —
+/// 生成到一半的对话会突然失败。所以让重启成为一个显式动作。
+struct PortEditor: View {
+    @EnvironmentObject var store: AppStore
+    @State private var draft = ""
+    @State private var saving = false
+    /// 是否刚刚保存过一个**当前进程还未使用**的新端口 —— 决定要不要提示重启。
+    @State private var savedPendingRestart = false
+
+    private var parsed: Int? { Int(draft.trimmingCharacters(in: .whitespaces)) }
+    private var valid: Bool { (parsed.map { (1024...65535).contains($0) }) ?? false }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                TextField("端口", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(width: 100)
+                    .onSubmit { save() }
+                Text("1024–65535")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button {
+                    save()
+                } label: {
+                    HStack(spacing: 5) {
+                        if saving { ProgressView().controlSize(.mini) }
+                        Text("保存")
+                    }
+                }
+                .controlSize(.small)
+                .disabled(!valid || saving || parsed == store.configuredPort)
+
+                if savedPendingRestart {
+                    Button {
+                        Task {
+                            await store.restartGateway()
+                            savedPendingRestart = false
+                        }
+                    } label: {
+                        Label("重启网关以生效", systemImage: "power")
+                    }
+                    .controlSize(.small)
+                    .disabled(store.restarting)
+                }
+            }
+
+            if !draft.isEmpty && !valid {
+                Text("端口必须是 1024–65535 的整数")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .onAppear { draft = "\(store.configuredPort)" }
+    }
+
+    private func save() {
+        guard let p = parsed, valid else { return }
+        let old = store.configuredPort      // 保存前先记住
+        saving = true
+        Task {
+            let ok = await store.setPort(p)
+            saving = false
+            // 只有真的改了端口才提示重启（值相同或写失败时不必打扰）。
+            savedPendingRestart = ok && p != old
+            await store.refresh()
         }
     }
 }

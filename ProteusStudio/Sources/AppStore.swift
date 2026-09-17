@@ -204,6 +204,79 @@ final class AppStore: ObservableObject {
     let chat = ChatEngine()
     let gateway = GMGateway()
 
+    // MARK: 端口（读/改 models.json 的 server.port）
+
+    /// 当前 models.json 里记录的端口（真相源）。
+    var configuredPort: Int { GatewayLocator.resolve().port }
+
+    /// 解析到的配置文件路径（供界面显示「端口来自哪里」）。
+    var configPath: String? { GatewayLocator.resolve().configPath }
+
+    @Published var portEditing = false
+    @Published var portMessage: String?
+
+    /// 修改端口：校验 → 写 models.json → 提示需重启。
+    ///
+    /// 与 CLI 的 `proteus port` 语义一致。GUI 侧不做「静默生效」——
+    /// 网关进程持有的是旧 socket，必须重启才能换端口，所以这里明确告知。
+    ///
+    /// 返回是否写入成功。
+    func setPort(_ newPort: Int) async -> Bool {
+        portMessage = nil
+        guard let path = configPath else {
+            portMessage = "找不到 models.json，无法修改端口。"
+            return false
+        }
+        guard (1024...65535).contains(newPort) else {
+            portMessage = "端口需在 1024–65535 之间（<1024 需要 root）。"
+            return false
+        }
+        if newPort == configuredPort {
+            portMessage = "端口已经是 \(newPort)，无需改动。"
+            return true
+        }
+        // 可写性：models.json 若归 root 所有（早期用 sudo 装过就会这样），
+        // 写入必然失败。提前拦下并给出确切命令，而不是抛一个看不懂的错误。
+        guard FileManager.default.isWritableFile(atPath: path) else {
+            let owner = (try? FileManager.default
+                .attributesOfItem(atPath: path)[.ownerAccountName] as? String) ?? nil
+            portMessage = "\(path) 不可写"
+                + (owner.map { "（归 \($0) 所有）" } ?? "")
+                + "。修复归属：sudo chown $(id -un) \"\(path)\""
+            return false
+        }
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            guard var obj = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any] else {
+                portMessage = "models.json 结构异常，无法解析。"
+                return false
+            }
+            var srv = (obj["server"] as? [String: Any]) ?? [:]
+            let old = (srv["port"] as? Int) ?? Int((srv["port"] as? NSNumber)?.intValue ?? 0)
+            srv["port"] = newPort
+            obj["server"] = srv
+            // 备份后写入，与 CLI 行为一致
+            let bak = path + ".bak." + Self.stamp()
+            try? FileManager.default.copyItem(atPath: path, toPath: bak)
+            let out = try JSONSerialization.data(withJSONObject: obj,
+                                                 options: [.prettyPrinted, .sortedKeys])
+            try out.write(to: URL(fileURLWithPath: path))
+            portMessage = "已保存：\(old) → \(newPort)。"
+                + "端口改动不会自动生效，请重启网关。"
+            return true
+        } catch {
+            portMessage = "写入失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private static func stamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd_HHmmss"
+        return f.string(from: Date())
+    }
+
     // ⚠️ 关键：`chat` 是嵌套的 ObservableObject，SwiftUI **不会**自动观察它。
     // 症状（用户实测报障）：发一条消息后界面毫无反应，切到别的标签页再切回来
     // 才突然看到全部输出。
