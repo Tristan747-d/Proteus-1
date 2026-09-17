@@ -148,6 +148,8 @@ struct SchemePicker: View {
 struct StatsStrip: View {
     @EnvironmentObject var store: AppStore
 
+    private var m: LiveMetrics { store.chat.last }
+
     var body: some View {
         HStack(spacing: 14) {
             // 对话轮数 —— 只统计**已完成的问答对**（用户一条 + 助手一条）。
@@ -156,21 +158,40 @@ struct StatsStrip: View {
                        value: "\(store.chat.turnCount)",
                        unit: "轮")
 
-            if store.stats.tps > 0 {
-                MetricChip(icon: "speedometer", value: String(format: "%.1f", store.stats.tps),
+            // ⚠️ 以下指标来自 ChatEngine 对**本次回答**的实测（m），
+            // 不再读网关全局 last_meta —— 那样只会拿到打开应用那一刻的
+            // 一个冻结快照（见 LiveMetrics 的说明）。
+            if m.tps > 0 {
+                MetricChip(icon: "speedometer",
+                           value: String(format: "%.1f", m.tps),
                            unit: "tok/s")
+                    .help("本次回答的 decode 速度（不含首 token 等待）")
             }
-            if store.stats.ttft > 0 {
-                MetricChip(icon: "bolt.fill", value: String(format: "%.2f", store.stats.ttft),
+            if m.ttft > 0 {
+                MetricChip(icon: "bolt.fill",
+                           value: String(format: "%.2f", m.ttft),
                            unit: "s TTFT")
+                    .help("本次回答：从发送到第一个字出现")
             }
-            if store.stats.speculative {
+            if m.tpotMs > 0 {
+                MetricChip(icon: "clock",
+                           value: String(format: "%.0f", m.tpotMs),
+                           unit: "ms/tok")
+                    .help("本次回答：首字之后每 token 平均耗时")
+            }
+            if m.accept > 0 {
                 MetricChip(icon: "wand.and.stars",
-                           value: String(format: "%.1f", store.stats.acceptLen),
+                           value: String(format: "%.1f", m.accept),
                            unit: "accept", tint: .accentColor)
+                    .help("""
+                    投机解码每轮被接受的草稿 token 数（中位）。
+                    一次目标模型前向可产出 accept+1 个 token；每轮另需 \
+                    \(m.draftTokens) 次草稿前向。共 \(m.acceptRounds) 轮。
+                    accept 越接近 \(m.draftTokens) 越赚；接近 0 说明草稿基本被拒。
+                    """)
             }
         }
-        .animation(.default, value: store.stats)
+        .animation(.default, value: m)
         .animation(.default, value: store.chat.turnCount)
     }
 }

@@ -35,6 +35,11 @@ struct GatewayStats: Equatable {
     var acceptRule = ""
     var numDraft = 0
     var acceptLen: Double = 0
+    /// 本次请求的验证轮数与 completion token 数 —— 后者用于**归属校验**：
+    /// /stats.last_meta 是全局字段，只有 token 数对得上才能确认这条记录
+    /// 属于我们的请求（见 ChatEngine.mergeAccept）。
+    var acceptRounds = 0
+    var completionTokens = 0
     var prefixCached = 0
     var uptime: Double = 0
 }

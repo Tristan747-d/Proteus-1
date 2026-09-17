@@ -35,6 +35,30 @@ struct ChatAttachment: Identifiable, Equatable {
     }
 }
 
+/// **本次回答**的实测指标。
+///
+/// 为什么不复用网关 /stats 的 last_meta（原先的做法，也是指标不刷新的根因）：
+///   1. 那是网关**全局**的最后一次请求，不是「你这条回答」。多客户端并发时
+///      （GUI 轮询 /stats、其它 agent 客户端接入）会互相覆盖。
+///   2. GUI 只在视图出现时读一次，之后再也不读 —— 于是数值永久冻结在打开
+///      应用那一刻，用户看到的是「指标不会变」。
+///   3. 只有网关自己算得出的量（如 accept）才需要向网关取；tps/ttft/tpot
+///      在这里本来就有完整时序，直接算，既准确又天然属于当前回答。
+struct LiveMetrics: Equatable {
+    var tps: Double = 0
+    var ttft: Double = 0
+    var tpotMs: Double = 0
+    /// 投机解码每轮接受长度中位。0 表示本次未启用投机。
+    var accept: Double = 0
+    var acceptRounds: Int = 0
+    var draftTokens: Int = 0
+    var tokens: Int = 0
+    var speculative: Bool = false
+    var at: Date?
+
+    static let empty = LiveMetrics()
+}
+
 /// 对话引擎 —— 管理消息列表、流式接收、性能指标。
 @MainActor
 final class ChatEngine: ObservableObject {
@@ -43,6 +67,8 @@ final class ChatEngine: ObservableObject {
     @Published var liveText = ""
     @Published var errorText: String?
     @Published var temperature: Double = 0.7
+    /// 本次回答的实测指标（取代原先读网关全局 last_meta 的做法）。
+    @Published var last = LiveMetrics.empty
     @Published var lastTTFT: Double = 0
     /// 待发送的附件（发送后清空）。
     @Published var pendingAttachments: [ChatAttachment] = []
@@ -85,6 +111,29 @@ final class ChatEngine: ObservableObject {
         task?.cancel()
         task = nil
         streaming = false
+    }
+
+    /// 从网关取回本次请求的 accept / 投机信息，补齐 LiveMetrics。
+    ///
+    /// 为什么需要向网关要：accept（每轮接受的草稿数）只有网关的投机循环
+    /// 知道，客户端从 SSE 流里看不到 —— 网关把同一轮的多 token 合并成了一个
+    /// chunk，轮边界信息不在流里。所以只能读 /stats.last_meta。
+    ///
+    /// ⚠️ 但它**是全局字段**，任何并发请求都会覆盖它。因此这里用
+    /// completion_tokens 做归属校验：对不上就说明这条记录不是本次请求的，
+    /// 直接放弃补 accept，绝不把别人的数字显示成你的。
+    /// 宁可少一个指标，也不要一个错的指标。
+    private func mergeAccept(expectedTokens: Int) async {
+        let s = await gateway.stats()
+        // 归属校验：token 数对不上就说明 last_meta 已被别的请求覆盖，
+        // 放弃补 accept —— 宁可少一个指标，也不要一个错的指标。
+        guard s.completionTokens == expectedTokens else { return }
+        var m = last
+        m.accept = s.acceptLen
+        m.acceptRounds = s.acceptRounds
+        m.draftTokens = s.numDraft
+        m.speculative = s.speculative
+        last = m
     }
 
     /// 发送一条消息。`attachments` 会作为 content parts 的 file 项附带。
@@ -184,6 +233,7 @@ final class ChatEngine: ObservableObject {
                 )
                 let elapsed = Date().timeIntervalSince(t0)
                 let ttft = clock.value
+                let ch = clock.chunkCount
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     if !full.isEmpty {
@@ -192,12 +242,35 @@ final class ChatEngine: ObservableObject {
                             ttft: ttft, elapsed: elapsed,
                             charsPerSec: elapsed > 0 ? Double(full.count) / elapsed : 0)
                         self.messages.append(msg)
-                        self.lastTPS = msg.charsPerSec ?? 0
+
+                        // ---- 本次回答的实测指标 ----
+                        // decode 时长 = 总时长 - TTFT（首 token 之后的净生成时间）。
+                        let decodeS = max(0, elapsed - (ttft ?? 0))
+                        let tps = decodeS > 0 ? Double(ch) / decodeS : 0
+                        self.last = LiveMetrics(
+                            tps: tps,
+                            ttft: ttft ?? 0,
+                            tpotMs: ch > 1 ? decodeS / Double(ch - 1) * 1000 : 0,
+                            accept: 0,          // 非投机路径无此概念
+                            acceptRounds: 0,
+                            draftTokens: 0,
+                            tokens: ch,
+                            speculative: false,
+                            at: Date())
                     } else if self.cancelled {
                         self.messages.append(ChatMessage(role: .assistant, text: "（已停止）"))
                     }
                     self.liveText = ""
                     self.streaming = false
+
+                    // accept 只有网关算得出来（它知道每轮验证接受了多少草稿）。
+                    // ⚠️ 它只存在于**全局** /stats.last_meta，因此必须校验这条
+                    // 记录确实属于本次请求；否则并发客户端会把别人的数字显示成
+                    // 你的（这正是 Phase-0 审计 §4.2 记过的串号问题）。
+                    // 校验依据：completion_tokens 应与本条消息的 token 数一致。
+                    if !full.isEmpty, ch > 0 {
+                        Task { await self.mergeAccept(expectedTokens: ch) }
+                    }
                 }
             } catch {
                 let desc = error.localizedDescription
@@ -321,12 +394,16 @@ private final class FirstDeltaClock: @unchecked Sendable {
     private let lock = NSLock()
     private let start: Date
     private var first: Double?
+    private var chunks = 0
+    /// 每个 chunk 的实际字符数 —— 用于把 tps 算成**每个 chunk 一个 token**。
+    private var chars = 0
 
     init(start: Date) { self.start = start }
 
-    /// 首次调用返回耗时，之后返回 nil。
+    /// 首次调用返回耗时，之后返回 nil。每次调用都会累计 chunk 数。
     func markIfFirst() -> Double? {
         lock.lock(); defer { lock.unlock() }
+        chunks += 1
         guard first == nil else { return nil }
         let d = Date().timeIntervalSince(start)
         first = d
@@ -336,5 +413,16 @@ private final class FirstDeltaClock: @unchecked Sendable {
     var value: Double? {
         lock.lock(); defer { lock.unlock() }
         return first
+    }
+
+    /// 收到的 chunk 总数。
+    ///
+    /// ⚠️ 用它而不是字符数来算 tps。网关在投机解码下会把同一轮的多 token
+    /// **合并成一个 chunk** 交付（见 spec_rejection.py 的 round 边界交付），
+    /// 所以「chunk 数」正是网关侧真实的 token 数，而字符数不是。用字符数
+    /// 会把 tps 算成 char/s —— 中英混排下与 tok/s 差一倍以上。
+    var chunkCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return chunks
     }
 }

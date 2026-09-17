@@ -179,6 +179,8 @@ actor GMGateway {
             out.acceptRule = (m["accept_rule"] as? String) ?? ""
             out.numDraft = (m["num_draft_tokens"] as? Int) ?? 0
             out.acceptLen = (m["accept_len_median"] as? Double) ?? 0
+            out.acceptRounds = (m["accept_rounds"] as? Int) ?? 0
+            out.completionTokens = (m["completion_tokens"] as? Int) ?? 0
             out.prefixCached = (m["prefix_cached_tokens"] as? Int) ?? 0
         }
         return out
