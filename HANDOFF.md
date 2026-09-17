@@ -44,7 +44,7 @@
 Unable to load libmodelpackage. Cannot make save spec.
 ```
 
-网关当前用 `/Users/tristan/ANEProbe/P6Model/phase4/.venv/bin/python`（3.11 + coremltools 9.0 + mlx-lm）。
+本机网关用的是 ANEProbe 实验台里的 3.11 venv（coremltools 9.0 + mlx-lm）；路径见 launchd plist。
 
 > 如果 Proteus-2 不碰 CoreML，用哪个 Python 都行；一旦要加载 CoreML 模型，必须是 3.11。
 
