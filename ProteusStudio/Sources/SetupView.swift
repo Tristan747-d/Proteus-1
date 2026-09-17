@@ -17,9 +17,31 @@ struct SetupView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                // 状态总览：让「接入模型」页自己说清楚当前到底有没有模型。
+                // 原先这页不显示任何当前状态，本地又没模型时整页看起来是空的，
+                // 与聊天页声称「有 Proteus-1 / GPU 可选」直接矛盾。
+                StatusCard()
+
                 // 步骤 1
                 Card(title: "选择模型目录", step: "1") {
                     VStack(alignment: .leading, spacing: 10) {
+                        if store.setup.candidates.isEmpty {
+                            HStack(spacing: 8) {
+                                Image(systemName: "info.circle")
+                                    .foregroundStyle(.secondary)
+                                Text("未在 ~/Models 或 HuggingFace 缓存中发现模型。"
+                                     + "请手动选择目录，或先用 mlx_lm 下载一个。")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(9)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.primary.opacity(0.045))
+                            }
+                        }
                         HStack(spacing: 8) {
                             TextField("/path/to/model", text: $path)
                                 .textFieldStyle(.roundedBorder)
@@ -160,7 +182,7 @@ struct SetupView: View {
         verdictKind = .none
 
         let args = ["-m", "gm.probe_cli", path]
-        let root = NSHomeDirectory() + "/GeneralModel"
+        let root = store.gatewayRoot
         Task.detached {
             let out = runPython(args, cwd: root)
             await MainActor.run {
@@ -186,7 +208,7 @@ struct SetupView: View {
     }
 
     private func write() {
-        let root = NSHomeDirectory() + "/GeneralModel"
+        let root = store.gatewayRoot
         let n = name.isEmpty ? URL(fileURLWithPath: path).lastPathComponent : name
         let out = runPython(["-m", "gm.probe_cli", path, "--write", "--name", n],
                             cwd: root)
@@ -227,6 +249,67 @@ func runPython(_ args: [String], cwd: String) -> ProcResult {
 }
 
 // MARK: - 通用卡片
+
+/// 「接入模型」页顶部的当前状态卡。
+struct StatusCard: View {
+    @EnvironmentObject var store: AppStore
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: icon)
+                .font(.system(size: 15))
+                .foregroundStyle(tint)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("刷新") { Task { await store.refresh() } }
+                .controlSize(.small)
+        }
+        .padding(13)
+        .background {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(tint.opacity(0.09))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(tint.opacity(0.22), lineWidth: 1)
+                }
+        }
+    }
+
+    private var icon: String {
+        if !store.stats.alive { return "bolt.horizontal.circle" }
+        return store.isConfigured ? "checkmark.seal.fill" : "square.stack.3d.up.slash"
+    }
+    private var tint: Color {
+        if !store.stats.alive { return .orange }
+        return store.isConfigured ? .green : .orange
+    }
+    private var title: String {
+        if !store.stats.alive { return "网关未运行" }
+        return store.isConfigured
+            ? "已接入 \(store.schemes.count) 个模型"
+            : "尚未接入任何模型"
+    }
+    private var detail: String {
+        if !store.stats.alive {
+            return "在终端运行 proteus startup，或用菜单「网关 → 重启网关」。"
+        }
+        if store.isConfigured {
+            return "可用：" + store.schemes.map(\.title).joined(separator: "、")
+                + "。可继续在下方探测并写入新的模型。"
+        }
+        return "网关在线但没有模型配置。在下方选择本地模型目录，探测通过后写入配置即可。"
+    }
+}
 
 struct Card<Content: View>: View {
     let title: String

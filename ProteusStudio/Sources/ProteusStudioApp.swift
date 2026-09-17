@@ -70,6 +70,10 @@ struct RootView: View {
             .background(Color(nsColor: .textBackgroundColor))
         }
         .task { await store.refresh() }
+        // 「去接入模型」按钮的落地：store 置位 → 这里消费并切页。
+        .onChange(of: store.requestSetupTab) { _, want in
+            if want { tab = .setup; store.requestSetupTab = false }
+        }
     }
 }
 

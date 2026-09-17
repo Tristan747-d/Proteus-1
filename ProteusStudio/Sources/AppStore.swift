@@ -45,26 +45,95 @@ struct GatewayStats: Equatable {
 
 @MainActor
 final class AppStore: ObservableObject {
-    // 方案定义 —— 与 models.json 的 aliases 对应。
-    // 命名约定：Proteus-1 = 当前全部优化（投机+prefix cache+KV int8）；
-    //           GPU = 研发前最原生 MLX 运行，作基线。
-    let schemes: [Scheme] = [
-        Scheme(id: "proteus-1", title: "Proteus-1",
-               detail: "投机解码 + prefix cache + KV int8",
-               badge: "最新", isBaseline: false),
-        Scheme(id: "gpu-baseline", title: "GPU",
-               detail: "原生 MLX 运行，无任何优化",
-               badge: "基线", isBaseline: true),
-    ]
+    // 方案定义 —— **不再是硬编码列表**，而是从网关的 /v1/models 动态构建。
+    //
+    // 为什么改（用户报障）：原先把两条 scheme 写死在代码里，而 refresh() 拿到
+    // 的 models 从未被使用。后果是：网关里根本没有模型（首次安装、models.json
+    // 尚未生成）时，界面依然列出 "Proteus-1 / GPU" 两个可选项，用户能选、能
+    // 发消息，然后失败 —— 而「接入模型」页此刻是空的，因为本地确实没模型。
+    // 逻辑自相矛盾：界面声称有东西，另一页证明没有。
+    //
+    // 现在 schemes 由真实模型列表驱动；空列表 = 未配置，聊天页据此禁用输入。
+    // 只有标题/说明这类展示性文案用 id 做已知映射，未知模型也能正常工作。
+    @Published private(set) var schemes: [Scheme] = []
+
+    /// 展示信息映射：已知模型 → 人类可读的标题与说明。
+    /// 未登记的模型不会被隐藏，只是用 id 本身当标题。
+    private static func describe(_ id: String) -> (String, String, String?, Bool) {
+        switch id {
+        case "proteus-1":
+            return ("Proteus-1", "投机解码 + prefix cache + KV int8", "最新", false)
+        case "gpu-baseline":
+            return ("GPU", "原生 MLX 运行，无任何优化", "基线", true)
+        default:
+            return (id, "自定义模型", nil, false)
+        }
+    }
+
+    /// 从网关返回的模型 id 列表重建方案表。
+    private func rebuildSchemes(from ids: [String]) {
+        let next = ids.map { id -> Scheme in
+            let (title, detail, badge, isBaseline) = Self.describe(id)
+            return Scheme(id: id, title: title, detail: detail,
+                          badge: badge, isBaseline: isBaseline)
+        }
+        schemes = next
+        // 选中项若已不存在（模型被删/网关换了配置），回落到第一个；
+        // 列表为空时保持 nil，由界面呈现「未接入」状态。
+        if let cur = selectedSchemeID, next.contains(where: { $0.id == cur }) {
+            // 保留当前选择，但刷新它的展示字段
+            selectedSchemeID = cur
+        } else {
+            selectedSchemeID = next.first?.id
+        }
+    }
+
+    /// 当前选中的方案。未配置时为 nil。
+    var selectedScheme: Scheme? {
+        guard let id = selectedSchemeID else { return nil }
+        return schemes.first { $0.id == id }
+    }
+
+    /// 是否已接入至少一个模型（决定聊天页能否发送）。
+    var isConfigured: Bool { !schemes.isEmpty }
+
+    /// 网关在线但没有任何模型 —— 首次安装的典型状态。
+    var needsSetup: Bool { stats.alive && schemes.isEmpty }
 
     /// 网关是否在线（供侧边栏指示灯用）。
     var gatewayAlive: Bool { stats.alive }
 
-    @Published var selectedScheme: Scheme
+    @Published var selectedSchemeID: String?
     @Published var stats = GatewayStats()
     @Published var models: [String] = []
     @Published var busy = false
     @Published var setup = SetupStore()
+
+    /// 置位后由 RootView 消费并跳到「接入模型」页。
+    /// 用一个一次性标志而不是直接持有 tab 状态：tab 属于 RootView 的
+    /// @State，store 不该反向拥有它，否则两边都可能改、状态就分叉了。
+    @Published var requestSetupTab = false
+
+    /// 网关源码根目录（gm 包所在处），供「接入模型」页调 gm.probe_cli 用。
+    ///
+    /// 原先写死成 `~/GeneralModel`，但工作目录后来改成了 ~/Proteus-Release，
+    /// 于是探测一定失败（cwd 下没有 gm 包）。这里按优先级找第一个真含
+    /// `gm/__main__.py` 的目录，找不到就让调用方明确报错，而不是拿一个
+    /// 猜的路径去跑。
+    var gatewayRoot: String {
+        let home = NSHomeDirectory()
+        let candidates = [
+            home + "/Proteus-Release",
+            home + "/GeneralModel",
+            Bundle.main.bundleURL.deletingLastPathComponent().path,
+        ]
+        for c in candidates {
+            if FileManager.default.fileExists(atPath: c + "/gm/__main__.py") {
+                return c
+            }
+        }
+        return candidates[0]
+    }
 
     let chat = ChatEngine()
     let gateway = GMGateway()
@@ -84,7 +153,6 @@ final class AppStore: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     init() {
-        selectedScheme = schemes[0]
         chat.objectWillChange
             .sink { [weak self] _ in
                 // 转发到下一轮 runloop：objectWillChange 在变更**之前**发出，
@@ -103,7 +171,10 @@ final class AppStore: ObservableObject {
         let (a, st) = await (alive, s)
         stats = st
         stats.alive = a
-        models = (try? await gateway.modelIDs()) ?? []
+        let ids = (try? await gateway.modelIDs()) ?? []
+        models = ids
+        // 用真实模型列表驱动方案表 —— 这是「未配置」状态的唯一判据。
+        rebuildSchemes(from: ids)
     }
 
     func newChat() { chat.reset() }

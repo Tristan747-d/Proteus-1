@@ -25,44 +25,35 @@ struct ChatToolbar: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            // 加速方案选择器 —— 分段控件，一眼看出当前跑哪套
-            VStack(alignment: .leading, spacing: 3) {
-                Text("加速方案")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $store.selectedScheme) {
-                    ForEach(store.schemes) { s in
-                        Text(s.title).tag(s)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 190)
-            }
+            // 模型切换器 —— 下拉菜单（取代原先的分段控件）。
+            // 选项来自网关真实的 /v1/models，不再硬编码。
+            ModelPicker()
 
-            // 方案说明
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    if let b = store.selectedScheme.badge {
-                        Text(b)
-                            .font(.system(size: 9, weight: .semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(
-                                Capsule().fill(store.selectedScheme.isBaseline
-                                               ? Color.secondary.opacity(0.15)
-                                               : Color.accentColor.opacity(0.15)))
-                            .foregroundStyle(store.selectedScheme.isBaseline
-                                             ? .secondary : Color.accentColor)
+            // 当前模型详情
+            if let s = store.selectedScheme {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        if let b = s.badge {
+                            Text(b)
+                                .font(.system(size: 9, weight: .semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    Capsule().fill(s.isBaseline
+                                                   ? Color.secondary.opacity(0.15)
+                                                   : Color.accentColor.opacity(0.15)))
+                                .foregroundStyle(s.isBaseline
+                                                 ? .secondary : Color.accentColor)
+                        }
+                        Text(s.detail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
-                    Text(store.selectedScheme.detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                if store.selectedScheme.isBaseline {
-                    Text("基线会明显慢于 Proteus-1，这是预期结果")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                    if s.isBaseline {
+                        Text("基线会明显慢于 Proteus-1，这是预期结果")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
 
@@ -74,6 +65,49 @@ struct ChatToolbar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.bar)
+    }
+}
+
+/// 模型切换器：下拉菜单 + 当前模型的关键参数。
+///
+/// 为什么要显示参数而不只是名字：proteus-1 与 gpu-baseline 跑的是**同一个
+/// 权重**，差别全在运行时参数上（投机是否开、nd 多少、KV 位宽）。只显示
+/// 名字的话，用户没法确认自己到底在跑哪套，而这恰恰是本项目最容易搞错的
+/// 一点（见 docs/PROTEUS2_PHASE0_AUDIT.md 的 D2/D3）。
+struct ModelPicker: View {
+    @EnvironmentObject var store: AppStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("模型")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            if store.schemes.isEmpty {
+                // 未配置：不显示一个空的下拉框假装有东西可选。
+                Text("未接入")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 190, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.primary.opacity(0.05))
+                    }
+            } else {
+                Picker("", selection: Binding(
+                    get: { store.selectedSchemeID ?? "" },
+                    set: { store.selectedSchemeID = $0 }
+                )) {
+                    ForEach(store.schemes) { s in
+                        Text(s.title).tag(s.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 190)
+            }
+        }
     }
 }
 
@@ -133,9 +167,16 @@ struct TranscriptView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
+                    // 未接入模型时，最上面放一张明确的引导卡。
+                    // 这是「首次打开无配置」的正确状态：聊天页保留可用，
+                    // 但明确告诉用户为什么发不出去、该去哪里配。
+                    if store.needsSetup {
+                        NeedsSetupBanner()
+                    }
+
                     if store.chat.isEmpty {
                         EmptyChatView { text in
-                            store.chat.send(text, model: store.selectedScheme.id)
+                            store.chat.send(text, model: store.selectedSchemeID ?? "")
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 60)
@@ -170,6 +211,55 @@ struct TranscriptView: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .onTapGesture { focused.wrappedValue = true }
+    }
+}
+
+/// 「尚未接入模型」引导卡。
+///
+/// 原先的行为是：网关没有模型时，聊天页照样显示可用的输入框，用户发消息必然
+/// 失败；而「接入模型」页此时是空的（本地确实没模型），两页逻辑互相矛盾。
+/// 这里把状态说清楚，并给一个直接跳到接入页的按钮。
+struct NeedsSetupBanner: View {
+    @EnvironmentObject var store: AppStore
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: store.stats.alive
+                  ? "square.stack.3d.up.slash"
+                  : "bolt.horizontal.circle")
+                .font(.system(size: 15))
+                .foregroundStyle(.orange)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.stats.alive ? "尚未接入任何模型" : "网关未运行")
+                    .font(.system(size: 12.5, weight: .semibold))
+                Text(store.stats.alive
+                     ? "网关在跑，但它没有可用的模型配置。请到「接入模型」页选择本地模型目录并写入配置。"
+                     : "先在终端运行 proteus startup，或到「服务」页查看状态。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            if store.stats.alive {
+                Button("去接入模型") { store.requestSetupTab = true }
+                    .controlSize(.small)
+            } else {
+                Button("刷新") { Task { await store.refresh() } }
+                    .controlSize(.small)
+            }
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.orange.opacity(0.22), lineWidth: 1)
+                }
+        }
     }
 }
 

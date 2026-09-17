@@ -40,6 +40,17 @@ final class ChatEngine: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !streaming else { return }
 
+        // ⚠️ 实质性拦截，而不只是把按钮变灰。
+        // 按钮禁用是 UI 层的礼貌，不能当作唯一防线：快捷键、菜单项、
+        // 代码路径都可能绕过它。没有模型 id 就绝不该发出请求 —— 那会往
+        // messages 里塞一条用户消息、再以失败告终，留下一段无法继续的
+        // 假对话。这里直接拒绝并给出可操作的原因。
+        guard !model.isEmpty else {
+            errorText = "尚未接入模型：网关没有可用的模型配置。"
+                + "请到「接入模型」页选择本地模型目录并写入配置。"
+            return
+        }
+
         errorText = nil
         messages.append(ChatMessage(role: .user, text: trimmed))
         liveText = ""
@@ -109,7 +120,25 @@ final class ChatEngine: ObservableObject {
                 let desc = error.localizedDescription
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    self.errorText = desc
+                    // 把底层网络错误翻译成可操作的话。原文形如
+                    // "Could not connect to the server."（NSURLError -1004），
+                    // 对用户没有指向性 —— 真正该做的是启动网关。
+                    let hint: String
+                    let ns = error as NSError
+                    if ns.domain == NSURLErrorDomain {
+                        switch ns.code {
+                        case NSURLErrorCannotConnectToHost,
+                             NSURLErrorNetworkConnectionLost,
+                             NSURLErrorTimedOut:
+                            hint = "无法连接网关（127.0.0.1:8320）。"
+                                + "请在终端运行 proteus startup，或用「网关 → 重启网关」。"
+                        default:
+                            hint = desc
+                        }
+                    } else {
+                        hint = desc
+                    }
+                    self.errorText = hint
                     self.streaming = false
                     self.liveText = ""
                 }

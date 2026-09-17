@@ -5,11 +5,13 @@
 # 每次改 Swift 源码都要重建。手敲那串 xcodebuild 参数容易漏 derivedDataPath
 # 而污染源码树。
 #
-# 也修掉了历史上两个坑：
+# 也修掉了历史上三个坑：
 #   · 复用 /tmp/proteus-build 曾留下 root 所有的中间产物，导致后续 rm 失败；
 #     现在每次用全新的临时目录构建。
 #   · 安装目录里的旧 .app 可能是 root 所有（早期用 sudo 装过），此时会明确
 #     提示你该跑什么，而不是抛一堆 Permission denied。
+#   · ProteusStudio.xcodeproj 同理可能是 root 所有，会让 xcodegen 以一句
+#     晦涩的 NSCocoaErrorDomain 513 失败；它是生成物，自动删除重建。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/ProteusStudio"
@@ -21,6 +23,22 @@ command -v xcodebuild >/dev/null || { echo "需要 Xcode" >&2; exit 1; }
 
 BD="$(mktemp -d "${TMPDIR:-/tmp}/proteus-build.XXXXXX")"
 trap 'rm -rf "$BD"' EXIT
+
+# ⚠️ XcodeGen 需要**重写** ProteusStudio.xcodeproj。若该目录曾由 sudo 生成，
+# 它就归 root 所有，xcodegen 会以一句很晦涩的 NSCocoaErrorDomain 513
+# ("couldn't be copied because you don't have permission") 失败。
+# .xcodeproj 是 project.yml 的生成物（且已被 .gitignore），删掉重建即可。
+if [ -d "$SRC/ProteusStudio.xcodeproj" ] && [ ! -w "$SRC/ProteusStudio.xcodeproj" ]; then
+  echo "==> ProteusStudio.xcodeproj 不属于当前用户（早期用 sudo 生成的）"
+  if rm -rf "$SRC/ProteusStudio.xcodeproj" 2>/dev/null; then
+    echo "    已删除，将由 xcodegen 重新生成"
+  else
+    echo "✗ 无法删除。执行一次即可修复归属："
+    echo "      sudo rm -rf \"$SRC/ProteusStudio.xcodeproj\""
+    echo "  然后重跑本脚本（它是 project.yml 的生成物，删掉不会丢东西）。"
+    exit 1
+  fi
+fi
 
 echo "==> 构建"
 ( cd "$SRC" && xcodegen generate >/dev/null )

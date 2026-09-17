@@ -9,8 +9,19 @@ struct ComposerView: View {
     @State private var hoveringSend = false
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // ⚠️ 必须同时要求「已选中一个模型」。原先只检查文本非空与是否在流式，
+        // 于是网关没有任何模型时输入框依然可发 —— 发出去必然失败，而用户
+        // 不知道原因（见 AppStore.isConfigured 的说明）。
+        store.isConfigured
+            && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !store.chat.streaming
+    }
+
+    /// 无法发送时的原因，用于占位符与提示。
+    private var blockedReason: String? {
+        if !store.stats.alive { return "网关未运行 —— 先在终端执行 proteus startup" }
+        if !store.isConfigured { return "尚未接入模型 —— 请到「接入模型」页配置" }
+        return nil
     }
 
     var body: some View {
@@ -19,9 +30,9 @@ struct ComposerView: View {
                 // 输入框：多行自适应，聚焦时描边高亮
                 ZStack(alignment: .topLeading) {
                     if draft.isEmpty {
-                        Text("输入消息…")
+                        Text(blockedReason ?? "输入消息…")
                             .font(.system(size: 13.5))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(blockedReason == nil ? .tertiary : .secondary)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
                             .allowsHitTesting(false)
@@ -34,6 +45,7 @@ struct ComposerView: View {
                         .focused($focused)
                         .frame(minHeight: 40, maxHeight: 130)
                         .fixedSize(horizontal: false, vertical: true)
+                        .disabled(!store.isConfigured)
                         .onKeyPress(.return) {
                             if NSEvent.modifierFlags.contains(.shift) {
                                 draft += "\n"
@@ -125,9 +137,9 @@ struct ComposerView: View {
     }
 
     private func send() {
-        guard canSend else { return }
+        guard canSend, let model = store.selectedSchemeID else { return }
         let text = draft
         draft = ""
-        store.chat.send(text, model: store.selectedScheme.id)
+        store.chat.send(text, model: model)
     }
 }
