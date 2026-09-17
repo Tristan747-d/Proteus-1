@@ -137,7 +137,7 @@ struct ComposerView: View {
     }
 
     private func send() {
-        guard canSend, let model = store.selectedSchemeID else { return }
+        guard canSend, let model = store.selectedEntryID else { return }
         let text = draft
         draft = ""
         store.chat.send(text, model: model)

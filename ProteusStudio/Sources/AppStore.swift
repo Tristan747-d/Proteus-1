@@ -4,14 +4,9 @@ import Combine
 
 // MARK: - 数据模型
 
-/// 一个可选的加速方案。对应 models.json 里的一条 model 条目。
-struct Scheme: Identifiable, Hashable {
-    let id: String          // 模型名（发给网关的 model 字段）
-    let title: String       // 显示名
-    let detail: String      // 说明
-    let badge: String?      // 角标，如 "最新"
-    let isBaseline: Bool
-}
+// 注：原先这里有一个 `struct Scheme`（id/title/detail/badge/isBaseline）。
+// 它已被 ModelEntryInfo（GMGateway.swift）取代 —— 后者直接来自网关的
+// /v1/models，带着 weight 与真实 params，不再需要界面自己编造文案。
 
 /// 一条对话消息。
 struct ChatMessage: Identifiable, Equatable {
@@ -41,71 +36,134 @@ struct GatewayStats: Equatable {
     var uptime: Double = 0
 }
 
+/// 一个权重模型（LLM 维度）。
+///
+/// 对应网关 config 里的一个权重路径。同一个权重下可以有多条 entry，
+/// 它们是「加速方案」维度上的不同运行配置。
+struct WeightModel: Identifiable, Hashable {
+    let path: String      // 权重目录的绝对路径（唯一键）
+    let name: String      // 显示名，如 "Llama-3.1-8B-Instruct-4bit"
+
+    var id: String { path }
+
+    /// 把目录名收拾成适合展示的样子。
+    /// 例：Llama-3.1-8B-Instruct-4bit → "Llama 3.1 8B Instruct"
+    var displayName: String {
+        var s = name
+        // 去掉量化后缀（参数量已在名字里体现，位宽属于运行配置不属于模型）
+        for suffix in ["-4bit", "-8bit", "-6bit", "-bf16", "-fp16"] {
+            if s.hasSuffix(suffix) { s = String(s.dropLast(suffix.count)); break }
+        }
+        s = s.replacingOccurrences(of: "-Instruct", with: "")
+        s = s.replacingOccurrences(of: "-", with: " ")
+        return s.isEmpty ? name : s
+    }
+
+    /// 参数量标签，如 "8B"。取名字里第一个「数字+B/b」片段。
+    ///
+    /// 用手写扫描而不是正则字面量 `/.../`：后者需要 Swift 5.7+ 的
+    /// bare-slash 正则并受 `-enable-bare-slash-regex` 影响，本项目按
+    /// Swift 5.10 配置编译时不受支持（实测报 "expected expression"）。
+    var sizeTag: String? {
+        let chars = Array(name)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isNumber else { i += 1; continue }
+            var j = i
+            while j < chars.count, chars[j].isNumber || chars[j] == "." { j += 1 }
+            // 数字后面必须紧跟 B/b，且不能是更长的单词的一部分
+            if j < chars.count, chars[j] == "B" || chars[j] == "b" {
+                let after = j + 1
+                let boundary = after >= chars.count || !chars[after].isLetter
+                if boundary {
+                    // chars[i...j] 已含末尾的 B/b，不要再补一个
+                    // （早期版本写成 + "B"，输出 "8BB"）。
+                    return String(chars[i...j]).uppercased()
+                }
+            }
+            i = j + 1
+        }
+        return nil
+    }
+
+    /// 量化位宽标签，如 "4-bit"。
+    var quantTag: String? {
+        for q in ["4bit", "8bit", "6bit"] where name.lowercased().contains(q) {
+            return q.replacingOccurrences(of: "bit", with: "-bit")
+        }
+        return nil
+    }
+}
+
 // MARK: - AppStore
 
 @MainActor
 final class AppStore: ObservableObject {
-    // 方案定义 —— **不再是硬编码列表**，而是从网关的 /v1/models 动态构建。
+    // 模型选择被拆成**两个正交维度**（用户明确要求）：
     //
-    // 为什么改（用户报障）：原先把两条 scheme 写死在代码里，而 refresh() 拿到
-    // 的 models 从未被使用。后果是：网关里根本没有模型（首次安装、models.json
-    // 尚未生成）时，界面依然列出 "Proteus-1 / GPU" 两个可选项，用户能选、能
-    // 发消息，然后失败 —— 而「接入模型」页此刻是空的，因为本地确实没模型。
-    // 逻辑自相矛盾：界面声称有东西，另一页证明没有。
+    //   ① LLM      —— 加载哪个权重模型（Llama-3.1-8B / 将来的 Qwen 等）
+    //   ② 加速方案 —— 同一权重下用哪套运行时配置（Proteus-1 / GPU 基线）
     //
-    // 现在 schemes 由真实模型列表驱动；空列表 = 未配置，聊天页据此禁用输入。
-    // 只有标题/说明这类展示性文案用 id 做已知映射，未知模型也能正常工作。
-    @Published private(set) var schemes: [Scheme] = []
+    // 为什么必须拆：当前 `proteus-1` 与 `gpu-baseline` **指向同一个权重**
+    // （Llama-3.1-8B-Instruct-4bit），只是参数不同。把它们当成两个「模型」
+    // 平铺在一个列表里，等于把「换模型」和「换运行配置」混为一谈 ——
+    // 用户看到两个名字，会以为背后是两个不同的模型。
+    //
+    // 数据来源是网关 /v1/models 的 weight 字段：同一 weight 的多条 entry
+    // 归为一组，组内按参数区分方案。
+    @Published private(set) var entries: [ModelEntryInfo] = []
 
-    /// 展示信息映射：已知模型 → 人类可读的标题与说明。
-    /// 未登记的模型不会被隐藏，只是用 id 本身当标题。
-    private static func describe(_ id: String) -> (String, String, String?, Bool) {
-        switch id {
-        case "proteus-1":
-            return ("Proteus-1", "投机解码 + prefix cache + KV int8", "最新", false)
-        case "gpu-baseline":
-            return ("GPU", "原生 MLX 运行，无任何优化", "基线", true)
-        default:
-            return (id, "自定义模型", nil, false)
+    /// 全部权重模型（去重后的 weight）。
+    var weightModels: [WeightModel] {
+        var seen = Set<String>()
+        var out: [WeightModel] = []
+        for e in entries where !seen.contains(e.weight) {
+            seen.insert(e.weight)
+            out.append(WeightModel(path: e.weight, name: e.weightName))
         }
+        return out
     }
 
-    /// 从网关返回的模型 id 列表重建方案表。
-    private func rebuildSchemes(from ids: [String]) {
-        let next = ids.map { id -> Scheme in
-            let (title, detail, badge, isBaseline) = Self.describe(id)
-            return Scheme(id: id, title: title, detail: detail,
-                          badge: badge, isBaseline: isBaseline)
-        }
-        schemes = next
-        // 选中项若已不存在（模型被删/网关换了配置），回落到第一个；
-        // 列表为空时保持 nil，由界面呈现「未接入」状态。
-        if let cur = selectedSchemeID, next.contains(where: { $0.id == cur }) {
-            // 保留当前选择，但刷新它的展示字段
-            selectedSchemeID = cur
-        } else {
-            selectedSchemeID = next.first?.id
-        }
+    /// 当前权重模型下可用的加速方案。
+    var availableSchemes: [ModelEntryInfo] {
+        guard let w = selectedWeight else { return [] }
+        return entries.filter { $0.weight == w }
     }
 
-    /// 当前选中的方案。未配置时为 nil。
-    var selectedScheme: Scheme? {
-        guard let id = selectedSchemeID else { return nil }
-        return schemes.first { $0.id == id }
+    /// 当前选中的权重模型（未配置时为 nil）。
+    var selectedWeight: String? {
+        if let w = selectedWeightPath, weightModels.contains(where: { $0.path == w }) {
+            return w
+        }
+        return weightModels.first?.path
     }
+
+    /// 当前选中的网关条目（= 权重 + 方案），就是发给网关的 model 字段。
+    var selectedEntry: ModelEntryInfo? {
+        let schemes = availableSchemes
+        if let id = selectedSchemeEntryID,
+           let hit = schemes.first(where: { $0.id == id }) {
+            return hit
+        }
+        return schemes.first
+    }
+
+    /// 实际发给网关的 model 字段。
+    var selectedEntryID: String? { selectedEntry?.id }
 
     /// 是否已接入至少一个模型（决定聊天页能否发送）。
-    var isConfigured: Bool { !schemes.isEmpty }
+    var isConfigured: Bool { !entries.isEmpty }
 
     /// 网关在线但没有任何模型 —— 首次安装的典型状态。
-    var needsSetup: Bool { stats.alive && schemes.isEmpty }
+    var needsSetup: Bool { stats.alive && entries.isEmpty }
 
     /// 网关是否在线（供侧边栏指示灯用）。
     var gatewayAlive: Bool { stats.alive }
 
-    @Published var selectedSchemeID: String?
+    @Published var selectedWeightPath: String?
+    /// 用户在「加速方案」控件里显式选中的条目 id（nil = 用该权重下的第一个）。
+    @Published var selectedSchemeEntryID: String?
     @Published var stats = GatewayStats()
-    @Published var models: [String] = []
     @Published var busy = false
     @Published var setup = SetupStore()
 
@@ -171,10 +229,22 @@ final class AppStore: ObservableObject {
         let (a, st) = await (alive, s)
         stats = st
         stats.alive = a
-        let ids = (try? await gateway.modelIDs()) ?? []
-        models = ids
-        // 用真实模型列表驱动方案表 —— 这是「未配置」状态的唯一判据。
-        rebuildSchemes(from: ids)
+        let list = (try? await gateway.modelEntries()) ?? []
+        entries = list
+        // 权重选择失效（模型被删 / 配置换了）时回落到第一个。
+        if let w = selectedWeightPath,
+           list.contains(where: { $0.weight == w }) {
+            // 保留
+        } else {
+            selectedWeightPath = list.first?.weight
+        }
+        // 方案选择同理：当前 id 已不存在就清空，由 selectedEntry 回落到第一个。
+        if let id = selectedSchemeEntryID,
+           list.contains(where: { $0.id == id }) {
+            // 保留
+        } else {
+            selectedSchemeEntryID = nil
+        }
     }
 
     func newChat() { chat.reset() }

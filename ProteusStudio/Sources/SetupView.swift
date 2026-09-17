@@ -295,8 +295,9 @@ struct StatusCard: View {
     }
     private var title: String {
         if !store.stats.alive { return "网关未运行" }
+        let n = store.weightModels.count
         return store.isConfigured
-            ? "已接入 \(store.schemes.count) 个模型"
+            ? "已接入 \(n) 个模型"
             : "尚未接入任何模型"
     }
     private var detail: String {
@@ -304,7 +305,13 @@ struct StatusCard: View {
             return "在终端运行 proteus startup，或用菜单「网关 → 重启网关」。"
         }
         if store.isConfigured {
-            return "可用：" + store.schemes.map(\.title).joined(separator: "、")
+            // 按权重模型列，并注明每个权重下有几套运行配置 —— 这两件事
+            // 是正交的，混在一起说会让人以为装了多个模型。
+            let parts = store.weightModels.map { w -> String in
+                let n = store.entries.filter { $0.weight == w.path }.count
+                return n > 1 ? "\(w.displayName)（\(n) 套配置）" : w.displayName
+            }
+            return "可用：" + parts.joined(separator: "、")
                 + "。可继续在下方探测并写入新的模型。"
         }
         return "网关在线但没有模型配置。在下方选择本地模型目录，探测通过后写入配置即可。"

@@ -1,5 +1,35 @@
 import Foundation
 
+/// 网关的一条模型条目，含它绑定的权重与运行时参数。
+///
+/// 注意 `weight` 与 `id` 的区别：`id` 是发给网关的 model 字段（一个运行配置），
+/// `weight` 是它加载的权重文件。多条 entry 可以共享同一个 weight —— 当前
+/// `proteus-1` 与 `gpu-baseline` 就是这种情况。界面据此分成两个维度。
+struct ModelEntryInfo: Identifiable, Hashable {
+    let id: String
+    let weight: String
+    let weightName: String
+    let speculative: Bool
+    let numDraftTokens: Int
+    let prefixCache: Bool
+    let kvBits: Int
+
+    /// 「加速方案」维度的说明文案。
+    var schemeDetail: String {
+        if !speculative && !prefixCache && kvBits == 0 {
+            return "原生 MLX 运行，无任何优化"
+        }
+        var parts: [String] = []
+        if speculative { parts.append("投机解码 nd=\(numDraftTokens)") }
+        if prefixCache { parts.append("prefix cache") }
+        if kvBits > 0 { parts.append("KV int\(kvBits)") }
+        return parts.joined(separator: " + ")
+    }
+
+    /// 是否是一套「无优化」的基线配置。
+    var isBaseline: Bool { !speculative && !prefixCache && kvBits == 0 }
+}
+
 /// gm 网关客户端 —— OpenAI 兼容，支持 SSE 流式。
 actor GMGateway {
     let base: URL
@@ -24,12 +54,40 @@ actor GMGateway {
     }
 
     func modelIDs() async throws -> [String] {
+        try await modelEntries().map(\.id)
+    }
+
+    /// 拉取网关的模型条目（含 weight 与 params）。
+    ///
+    /// 为什么需要比 id 更多的信息：同一个权重可以配成多条 entry（当前
+    /// `proteus-1` 与 `gpu-baseline` 就都指向 Llama-3.1-8B-Instruct-4bit，
+    /// 只有运行时参数不同）。界面要分成「选哪个 LLM」和「用哪套加速配置」
+    /// 两个正交维度，就必须能看出哪些 entry 共享同一个权重 —— 只看 id
+    /// 是分辨不出来的。
+    ///
+    /// 兼容性：`weight` / `params` 是本网关新增字段。旧版网关不返回时，
+    /// 退化为「每条 entry 自成一个 weight」，界面仍能工作（只是不再分组）。
+    func modelEntries() async throws -> [ModelEntryInfo] {
         var req = URLRequest(url: base.appendingPathComponent("v1/models"))
         req.timeoutInterval = 6
         let (data, _) = try await session.data(for: req)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let arr = obj["data"] as? [[String: Any]] else { return [] }
-        return arr.compactMap { $0["id"] as? String }
+        return arr.compactMap { d in
+            guard let id = d["id"] as? String else { return nil }
+            let weight = (d["weight"] as? String) ?? id
+            let wname = (d["weight_name"] as? String)
+                ?? weight.split(separator: "/").last.map(String.init) ?? id
+            let p = d["params"] as? [String: Any] ?? [:]
+            return ModelEntryInfo(
+                id: id,
+                weight: weight,
+                weightName: wname,
+                speculative: (p["speculative"] as? Bool) ?? false,
+                numDraftTokens: (p["num_draft_tokens"] as? Int) ?? 0,
+                prefixCache: (p["prefix_cache"] as? Bool) ?? false,
+                kvBits: (p["kv_bits"] as? Int) ?? 0)
+        }
     }
 
     func stats() async -> GatewayStats {

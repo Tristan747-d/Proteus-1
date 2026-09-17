@@ -29,6 +29,18 @@ def _error_body(message: str, etype: str = "invalid_request_error") -> Dict[str,
     return {"error": {"message": message, "type": etype, "code": None}}
 
 
+def _weight_name(path: str) -> str:
+    """从权重路径取一个人类可读的名字（最后一节目录名）。
+
+    同一路径的多条 entry 会得到同一个 weight_name —— 这正是界面用来判断
+    「这两项其实是同一个模型」的依据。
+    """
+    try:
+        return str(path).rstrip("/").split("/")[-1] or str(path)
+    except Exception:
+        return str(path)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "gm/0.1"
@@ -85,6 +97,19 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         elif path == "/v1/models":
+            # 除 OpenAI 标准字段外，额外暴露两条「本网关特有」的信息，
+            # 因为客户端无法从别处得知它们：
+            #
+            #   weight  —— 权重模型标识（config 里的 path）。
+            #              同一个 weight 可以配成多条 entry（同一个 8B 权重，
+            #              一条开投机、一条关，就产生两个 id）。GUI 要按
+            #              「权重模型」分组选择，就必须能看出这一点，
+            #              否则只能把所有 id 平铺成一个列表，把「换模型」
+            #              和「换运行配置」混为一谈。
+            #   params  —— 该 entry 的运行时参数，供界面显示当前跑的是哪套
+            #              （投机是否开、nd、KV 位宽）。只读投影，不含路径
+            #              之外的本机敏感信息 —— path 本来就是本机路径，
+            #              而本服务只监听 127.0.0.1。
             data = [
                 {
                     "id": e.name,
@@ -92,6 +117,22 @@ class Handler(BaseHTTPRequestHandler):
                     "owned_by": "local",
                     "aliases": e.aliases,
                     "runtime": e.runtime,
+                    "weight": e.path,
+                    "weight_name": _weight_name(e.path),
+                    "params": {
+                        "speculative": bool(
+                            ((e.params or {}).get("speculative") or {})
+                            .get("enabled", False)),
+                        "num_draft_tokens": int(
+                            ((e.params or {}).get("speculative") or {})
+                            .get("num_draft_tokens", 0) or 0),
+                        "prefix_cache": bool(
+                            ((e.params or {}).get("prefix_cache") or {})
+                            .get("enabled", False)),
+                        "kv_bits": int(
+                            ((e.params or {}).get("prefix_cache") or {})
+                            .get("kv_bits", 0) or 0),
+                    },
                 }
                 for e in m.registry.entries
             ]

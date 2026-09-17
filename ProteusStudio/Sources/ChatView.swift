@@ -24,42 +24,17 @@ struct ChatToolbar: View {
     @EnvironmentObject var store: AppStore
 
     var body: some View {
-        HStack(spacing: 14) {
-            // 模型切换器 —— 下拉菜单（取代原先的分段控件）。
-            // 选项来自网关真实的 /v1/models，不再硬编码。
-            ModelPicker()
+        HStack(spacing: 16) {
+            // ① LLM —— 加载哪个权重模型
+            LLMPicker()
 
-            // 当前模型详情
-            if let s = store.selectedScheme {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        if let b = s.badge {
-                            Text(b)
-                                .font(.system(size: 9, weight: .semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(
-                                    Capsule().fill(s.isBaseline
-                                                   ? Color.secondary.opacity(0.15)
-                                                   : Color.accentColor.opacity(0.15)))
-                                .foregroundStyle(s.isBaseline
-                                                 ? .secondary : Color.accentColor)
-                        }
-                        Text(s.detail)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    if s.isBaseline {
-                        Text("基线会明显慢于 Proteus-1，这是预期结果")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
+            Divider().frame(height: 26)
+
+            // ② 加速方案 —— 同一权重下用哪套运行配置（与选模型正交）
+            SchemePicker()
 
             Spacer()
 
-            // 实时指标
             StatsStrip()
         }
         .padding(.horizontal, 16)
@@ -68,13 +43,13 @@ struct ChatToolbar: View {
     }
 }
 
-/// 模型切换器：下拉菜单 + 当前模型的关键参数。
+/// LLM 选择器：按**权重模型**分组，而不是按网关 entry 平铺。
 ///
-/// 为什么要显示参数而不只是名字：proteus-1 与 gpu-baseline 跑的是**同一个
-/// 权重**，差别全在运行时参数上（投机是否开、nd 多少、KV 位宽）。只显示
-/// 名字的话，用户没法确认自己到底在跑哪套，而这恰恰是本项目最容易搞错的
-/// 一点（见 docs/PROTEUS2_PHASE0_AUDIT.md 的 D2/D3）。
-struct ModelPicker: View {
+/// 原先这里是「Proteus-1 / GPU」二选一 —— 那两项其实指向同一个权重
+/// （Llama-3.1-8B-Instruct-4bit），只是运行参数不同。把它们摆在「模型」
+/// 位置上会让人以为背后是两个模型。现在这里只列真正的权重模型，
+/// 参数差异交给旁边的 SchemePicker。
+struct LLMPicker: View {
     @EnvironmentObject var store: AppStore
 
     var body: some View {
@@ -83,12 +58,11 @@ struct ModelPicker: View {
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            if store.schemes.isEmpty {
-                // 未配置：不显示一个空的下拉框假装有东西可选。
+            if store.weightModels.isEmpty {
                 Text("未接入")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
-                    .frame(width: 190, alignment: .leading)
+                    .frame(width: 210, alignment: .leading)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
                     .background {
@@ -97,16 +71,76 @@ struct ModelPicker: View {
                     }
             } else {
                 Picker("", selection: Binding(
-                    get: { store.selectedSchemeID ?? "" },
-                    set: { store.selectedSchemeID = $0 }
+                    get: { store.selectedWeight ?? "" },
+                    set: { newValue in
+                        store.selectedWeightPath = newValue
+                        // 换模型时清掉方案选择，让它落到新权重下的默认方案 ——
+                        // 否则会残留上一个模型的 entry id，选中项不可预测。
+                        store.selectedSchemeEntryID = nil
+                    }
                 )) {
-                    ForEach(store.schemes) { s in
-                        Text(s.title).tag(s.id)
+                    ForEach(store.weightModels) { w in
+                        Text(w.displayName).tag(w.path)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 190)
+                .frame(width: 210)
+                .disabled(store.weightModels.count <= 1)
+                .help(store.weightModels.count <= 1
+                      ? "当前只接入了一个权重模型"
+                      : "选择要加载的权重模型")
             }
+        }
+    }
+}
+
+/// 加速方案选择器：当前权重下可用的运行配置。
+///
+/// 只显示**实质性差异**（投机是否开、nd、prefix cache、KV 位宽），
+/// 因为同一权重的各方案跑的是同一批权重，参数才是唯一区别。
+struct SchemePicker: View {
+    @EnvironmentObject var store: AppStore
+
+    private var schemes: [ModelEntryInfo] { store.availableSchemes }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("加速方案")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Picker("", selection: Binding(
+                    get: { store.selectedEntry?.id ?? "" },
+                    set: { store.selectedSchemeEntryID = $0 }
+                )) {
+                    ForEach(schemes) { s in
+                        Text(shortTitle(s)).tag(s.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 130)
+                .disabled(schemes.isEmpty)
+
+                // 当前方案的参数详情 —— 这是「我到底在跑哪套」的唯一依据
+                if let s = store.selectedEntry {
+                    Text(s.schemeDetail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(s.isBaseline ? .tertiary : .secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 220, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    /// entry 的短标签：已知 id 用友好名，未知的用 id 本身。
+    private func shortTitle(_ s: ModelEntryInfo) -> String {
+        switch s.id {
+        case "gpu-baseline", "gpu", "raw": return "GPU 基线"
+        case "proteus-1", "proteus1", "default": return "Proteus-1"
+        default: return s.id
         }
     }
 }
@@ -176,7 +210,7 @@ struct TranscriptView: View {
 
                     if store.chat.isEmpty {
                         EmptyChatView { text in
-                            store.chat.send(text, model: store.selectedSchemeID ?? "")
+                            store.chat.send(text, model: store.selectedEntryID ?? "")
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 60)
