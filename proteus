@@ -29,6 +29,18 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ⚠️ install.sh 把 CLI 以**符号链接**装到 ~/.local/bin。若直接解析
+# BASH_SOURCE 得到的是链接所在目录（~/.local/bin），而不是仓库真实位置，
+# 于是找不到 models.json。这里跟随链接解析回真实目录。
+if [ -L "${BASH_SOURCE[0]}" ]; then
+  _real="$(readlink "${BASH_SOURCE[0]}")"
+  case "$_real" in
+    /*) ;;
+    *) _real="$(dirname "${BASH_SOURCE[0]}")/$_real" ;;
+  esac
+  HERE="$(cd "$(dirname "$_real")" && pwd)"
+  unset _real
+fi
 LABEL="com.tristan.gm.gateway"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="/tmp/gm-gateway.log"
@@ -153,8 +165,13 @@ is_loaded() {
 # 幂等语义：label 未占用 → 直接装；已占用且**配置完全一致** → 提示无需操作；
 # 已占用但配置不同 → 默认拒绝，要求 --adopt 明确覆盖当前运行的服务。
 current_plist_path() {
+  # ⚠️ 必须 `|| true`：服务不存在时 `launchctl print` 返回 113，而在
+  # `set -e` 下这个非零退出会从命令替换里冒出来，直接把整个 CLI 静默杀掉
+  # （实测：proteus startup 在 "配置: models.json" 之后无输出、退出 113）。
+  # 这是本 CLI 开发中最后也最难找的一个 bug —— 报错被 2>/dev/null 吞掉，
+  # 表面现象是"什么都没发生"。
   launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
-    | awk '/path = /{print $3; exit}'
+    | awk '/path = /{print $3; exit}' || true
 }
 
 assert_install_safe() {
@@ -231,9 +248,19 @@ cmd_install() {
     # bootout 是异步的，给 launchd 一点时间释放 label
     for _ in 1 2 3 4 5; do is_loaded || break; sleep 0.3; done
   fi
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
-    || launchctl load -w "$PLIST" 2>/dev/null \
-    || die "launchd 加载失败：$PLIST"
+
+  # ⚠️ 不要写成 `bootstrap || load || die`：两个命令都会失败时，真正的原因
+  # 被 2>/dev/null 吞掉，只看到一句无信息的 die（实测：退出码 113 = "service
+  # already loaded"，但因为在 is_loaded 检测之后仍报此错，排查花了很久）。
+  # 这里保留 stderr，失败时把原始错误打出来。
+  local err
+  if ! err="$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1)"; then
+    # 老系统没有 bootstrap，退回 load
+    if ! err="$(launchctl load -w "$PLIST" 2>&1)"; then
+      die "launchd 加载失败：
+    ${err}"
+    fi
+  fi
   ok "服务已加载（KeepAlive 生效，崩溃自动重启）"
 }
 
@@ -298,7 +325,8 @@ cmd_status() {
   say "服务状态"
   if is_loaded; then
     local pid
-    pid="$(launchctl list 2>/dev/null | awk -v L="$LABEL" '$3==L {print $1}')"
+    # `|| true` 同 current_plist_path：避免 set -e 把非零退出从命令替换里抛出。
+    pid="$(launchctl list 2>/dev/null | awk -v L="$LABEL" '$3==L {print $1}' || true)"
     if [ -n "$pid" ] && [ "$pid" != "-" ]; then
       ok "launchd: 已加载 (pid $pid)"
     else
