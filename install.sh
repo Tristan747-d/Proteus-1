@@ -48,6 +48,21 @@ if ! uname -m | grep -q arm64; then
 fi
 ok "架构: $(uname -m)"
 
+# 工作目录必须在本地盘。launchd 进程读 iCloud 里的 .py 会触发 fileprovider
+# 死锁（Errno 11 Resource deadlock avoided），而终端里跑同一份代码正常 ——
+# 所以这个坑只在「装成服务之后」才暴露，必须在这里拦下。
+case "$HERE" in
+  *"Mobile Documents"*|*"com~apple~CloudDocs"*)
+    warn "本目录在 iCloud 内："
+    warn "  $HERE"
+    warn "launchd 服务不能用 iCloud 路径作 WorkingDirectory（会 EDEADLK 死锁）。"
+    warn "建议移到本地盘后再装服务，例如："
+    echo "      mv \"$HERE\" ~/Proteus-Release && cd ~/Proteus-Release && ./install.sh"
+    warn "（安装会继续，但 proteus startup 将拒绝在 iCloud 路径下装服务）"
+    ;;
+  *) ok "工作目录在本地盘: $HERE" ;;
+esac
+
 # ---------------------------------------------------------------- 模型路径
 say "配置模型路径"
 
@@ -84,6 +99,47 @@ else
 fi
 
 chmod +x gm-probe 2>/dev/null || true
+chmod +x proteus 2>/dev/null || true
+
+# ---------------------------------------------------------------- CLI 安装
+say "安装 proteus 命令行工具"
+
+# 优先装到已在 PATH 里的**用户可写** bin 目录。
+# ⚠️ 必须同时检查可写性：/usr/local/bin 常在 PATH 里但普通用户不可写，
+# 早期版本因此直接 Permission denied 并中断整个安装（实测踩到）。
+BIN_DIR=""
+for cand in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
+  case ":$PATH:" in
+    *":$cand:"*) ;;
+    *) continue ;;
+  esac
+  if [ -d "$cand" ] && [ -w "$cand" ]; then BIN_DIR="$cand"; break; fi
+  if [ ! -e "$cand" ] && [ -w "$(dirname "$cand")" ]; then BIN_DIR="$cand"; break; fi
+done
+
+if [ -z "$BIN_DIR" ]; then
+  BIN_DIR="$HOME/.local/bin"
+  mkdir -p "$BIN_DIR"
+fi
+
+# 用符号链接而不是拷贝：改 Proteus-Release 后 CLI 立即生效，不会分叉两份。
+if ln -sf "$HERE/proteus" "$BIN_DIR/proteus" 2>/dev/null; then
+  ok "已链接: $BIN_DIR/proteus -> $HERE/proteus"
+else
+  warn "无法写入 $BIN_DIR/proteus，改装到 ~/.local/bin"
+  BIN_DIR="$HOME/.local/bin"
+  mkdir -p "$BIN_DIR"
+  ln -sf "$HERE/proteus" "$BIN_DIR/proteus"
+  ok "已链接: $BIN_DIR/proteus"
+fi
+
+case ":$PATH:" in
+  *":$BIN_DIR:"*) : ;;
+  *)
+    warn "$BIN_DIR 不在 PATH 里，请加一行到 shell 配置（~/.zshrc）："
+    echo "      export PATH=\"$BIN_DIR:\$PATH\""
+    ;;
+esac
 
 # ---------------------------------------------------------------- 可选构建
 if command -v xcodegen >/dev/null 2>&1 && command -v xcodebuild >/dev/null 2>&1; then
@@ -113,14 +169,19 @@ cat <<EOF
 ────────────────────────────────────────────────
  安装完成
 
- 启动网关：
-   $PY -m gm --config models.json
+ 启动（网关 + 界面一起）：
+   proteus startup
 
- 探测新模型：
-   ./gm-probe /path/to/model
+ 其它命令：
+   proteus status            查看服务与模型状态
+   proteus stop              停止
+   proteus restart           重启
+   proteus logs -f           跟踪日志
+   proteus doctor            环境自检
+   proteus --help            全部命令
 
- 打开界面：
-   open ~/Applications/"Proteus Studio.app"
+ 注意：proteus startup 首次运行会自动安装 launchd 服务
+       （KeepAlive 生效，网关崩溃会自动重启，开机自启）。
 
  更多说明见 README.md
 ────────────────────────────────────────────────

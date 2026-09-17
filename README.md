@@ -44,7 +44,8 @@ gpu-baseline   ~24 tok/s      speculative=False
 ```
 
 The script checks dependencies, finds your model, generates `models.json`
-from a template, and optionally builds the app. It is idempotent.
+from a template, adds the `proteus` command to your PATH, and optionally
+builds the app. It is idempotent.
 
 If you'd rather do it by hand:
 
@@ -54,16 +55,41 @@ cp models.json.template models.json   # then edit the @MODEL_DIR@ placeholder
 python3 -m gm --config models.json
 ```
 
+> ⚠️ **Keep this directory on a local disk, not iCloud.** A launchd service
+> whose `WorkingDirectory` is inside iCloud deadlocks in fileprovider
+> (`Errno 11 Resource deadlock avoided`) — running the same code from a
+> terminal works fine, so the problem only appears *after* you install the
+> service. `install.sh` and `proteus doctor` both check for this.
+
 ---
 
 ## Use
 
-**Start the gateway**
+**Start everything (gateway + app)**
 
 ```bash
-python3 -m gm --config models.json
-# → http://127.0.0.1:8320
+proteus startup
+# → installs the launchd service on first run, starts it, opens the app
 ```
+
+**The `proteus` command**
+
+| Command | What it does |
+|---|---|
+| `proteus startup` | Start the gateway service **and** open the app |
+| `proteus stop` | Stop the service (`KeepAlive` is released, so it stays down) |
+| `proteus restart` | Restart the service |
+| `proteus status` | Service state, available models, loaded model, recent request |
+| `proteus logs [-f]` | Show (or follow) the gateway log |
+| `proteus gui` | Open the app only |
+| `proteus doctor` | Environment self-check (interpreter, model paths, plist) |
+| `proteus install [--adopt]` | Install/refresh the launchd service |
+| `proteus uninstall` | Remove the launchd service |
+
+The gateway runs as a **launchd** service, so `KeepAlive` restarts it if it
+crashes, and it starts at login. `proteus install` refuses to silently
+overwrite a running service whose configuration differs — pass `--adopt` to
+switch deliberately.
 
 **Connect any agent client**
 
@@ -125,6 +151,9 @@ ProteusStudio/         macOS app (SwiftUI)
 project.yml            xcodegen manifest
 models.json.template   config template (paths are placeholders)
 install.sh             one-shot setup
+proteus                service CLI (startup/stop/status/logs/doctor)
+tools/
+  gw_bench.py          gateway benchmark with host-state guard
 docs/                  the research record
 ```
 
@@ -135,11 +164,31 @@ docs/                  the research record
 | Document | Contents |
 |---|---|
 | [`docs/`](docs/) | The full Proteus research report — every phase, every negative result, every correction |
+| [`docs/PROTEUS2_PHASE0_AUDIT.md`](docs/PROTEUS2_PHASE0_AUDIT.md) | **Proteus-2 Phase-0 audit** — what the current baseline actually is, which measurements can be trusted, and which cannot |
 
 The research record is deliberately kept in full, including the conclusions
 that were later overturned. If you want to know *why* this project does not
 attempt ANE offload, or *why* it distrusts short benchmark runs on a fanless
 Mac, that is where the evidence lives.
+
+### Measuring
+
+`tools/gw_bench.py` measures through the real HTTP surface and **refuses to
+produce numbers when the host looks dirty** (swap > 1 GB or load1 > 5), because
+memory pressure on this machine has been measured to pollute a benchmark
+3–11×. Pass `--force` for indicative data only.
+
+```bash
+proteus startup
+python3 tools/gw_bench.py --model proteus-1 --label baseline --rounds 3
+```
+
+### ⚠️ Known baseline caveat
+
+`gpu-baseline` is **not** a bare MLX baseline: it also drops `kv_bits` from 8
+to 0 (fp16 KV), so a `proteus-1` vs `gpu-baseline` difference mixes the
+speculative-decoding gain together with the KV-quantisation gain. They cannot
+be separated without an additional arm. See the Phase-0 audit, §3.
 
 ---
 

@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# Proteus Studio —— 服务管理 CLI
+#
+# 用法：
+#   proteus startup          启动网关服务 + 打开 GUI
+#   proteus stop             停止服务（含 GUI 可选）
+#   proteus restart          重启服务
+#   proteus status           查看服务与模型状态
+#   proteus logs [-f]        查看网关日志
+#   proteus gui              只打开 GUI
+#   proteus install          安装/更新 launchd 服务（幂等）
+#   proteus uninstall        移除 launchd 服务
+#   proteus doctor           环境自检
+#
+# 设计说明
+# --------
+# 为什么用 launchd 而不是 nohup：
+#   launchd 的 KeepAlive 能在网关崩溃时自动拉起，且开机自启。代价是必须
+#   写 plist。本脚本把 plist 的生成/安装/更新全部封装，避免手写 XML 出错
+#   （历史事故：plist 里同时存在 Python 3.14 与 iCloud 工作目录两个致命
+#   配置，见 docs/PROTEUS2_PHASE0_AUDIT.md 的 D1）。
+#
+# 关键配置约束（不得违反，均有实测依据）：
+#   * 解释器必须是装了 mlx_lm 的那个（通常是 venv）。系统 Python 3.14
+#     的 coremltools 缺 libcoremlpython，且 mlx_lm 未必装。
+#   * WorkingDirectory 必须是**本地盘**目录，绝不可用 iCloud 路径 ——
+#     launchd 进程读 iCloud 里的 .py 会触发 fileprovider 死锁
+#     （Errno 11 Resource deadlock avoided）。见项目铁律 #7。
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LABEL="com.tristan.gm.gateway"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="/tmp/gm-gateway.log"
+GUI_APP="$HOME/Applications/Proteus Studio.app"
+
+# 颜色（非 tty 时自动关闭）
+if [ -t 1 ]; then
+  B=$'\033[1;34m'; G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; N=$'\033[0m'
+else
+  B=''; G=''; Y=''; R=''; N=''
+fi
+say()  { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '%s ✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s !%s %s\n' "$Y" "$N" "$*"; }
+die()  { printf '%s ✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- 环境发现
+
+# 找出一个「能用」的 Python：优先 venv（含 mlx_lm），其次系统。
+find_python() {
+  # 1) 已有的 plist 里记的解释器（保证 restart 不变更环境）
+  if [ -f "$PLIST" ]; then
+    local prev
+    prev="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || true)"
+    if [ -n "$prev" ] && [ -x "$prev" ] && "$prev" -c 'import mlx_lm' 2>/dev/null; then
+      printf '%s' "$prev"; return 0
+    fi
+  fi
+  # 2) PROTEUS_PYTHON 覆盖
+  if [ -n "${PROTEUS_PYTHON:-}" ] && [ -x "${PROTEUS_PYTHON}" ]; then
+    printf '%s' "$PROTEUS_PYTHON"; return 0
+  fi
+  # 3) 常见 venv 位置
+  local c
+  for c in "$HERE/.venv/bin/python" "$HOME/.venvs/proteus/bin/python"; do
+    if [ -x "$c" ] && "$c" -c 'import mlx_lm' 2>/dev/null; then
+      printf '%s' "$c"; return 0
+    fi
+  done
+  # 4) PATH 上的 python3，必须真能 import mlx_lm
+  for c in python3.13 python3.12 python3.11 python3; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import mlx_lm' 2>/dev/null; then
+      printf '%s' "$(command -v "$c")"; return 0
+    fi
+  done
+  return 1
+}
+
+# 工作目录：必须是本地盘（非 iCloud）。这是硬约束。
+find_workdir() {
+  printf '%s' "$HERE"
+}
+
+assert_local_workdir() {
+  local wd="$1"
+  case "$wd" in
+    *"Mobile Documents"*|*"com~apple~CloudDocs"*)
+      # ⚠️ 变量后紧跟中文标点必须写成 ${wd}：bash 在 set -u 下会把
+      # 多字节字符的首字节并入变量名，报 "wd?: unbound variable"。
+      die "工作目录在 iCloud 内（${wd}）。
+    launchd 进程读 iCloud 里的 .py 会触发 fileprovider 死锁（EDEADLK）。
+    请把 Proteus-Release 移到本地盘，例如 ~/Proteus-Release。
+    参见项目铁律 #7 与 docs/PROTEUS2_PHASE0_AUDIT.md 的 D1。"
+      ;;
+  esac
+  [ -d "$wd" ] || die "工作目录不存在: $wd"
+}
+
+# ---------------------------------------------------------------- plist
+
+write_plist() {
+  local py="$1" wd="$2" cfg="$3"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$py</string>
+		<string>-m</string>
+		<string>gm</string>
+		<string>--config</string>
+		<string>$cfg</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>$wd</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>$(dirname "$py"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>$LOG</string>
+	<key>StandardErrorPath</key>
+	<string>$LOG</string>
+</dict>
+</plist>
+EOF
+  # XML 语法自检 —— 写坏了 launchd 会静默不加载
+  plutil -lint "$PLIST" >/dev/null 2>&1 || die "生成的 plist 语法错误: $PLIST"
+}
+
+is_loaded() {
+  launchctl list 2>/dev/null | awk -v L="$LABEL" '$3==L {found=1} END {exit !found}'
+}
+
+# ⚠️ launchd 的 label 是**全局唯一**的：两次 bootstrap 同一个 label，后者会
+# 静默顶掉前者。开发本 CLI 时实测踩到两次：
+#   ① 在临时 HOME 里测 install，把生产网关顶掉了，且测试目录随后被删；
+#   ② 在 Proteus-Release 里跑 install，把生产的 WorkingDirectory 从
+#      ~/GeneralModel 悄悄改成了 ~/Proteus-Release。
+# 两次都不是"报错"，而是**静默替换**。所以安装前必须显式比对现有配置。
+#
+# 幂等语义：label 未占用 → 直接装；已占用且**配置完全一致** → 提示无需操作；
+# 已占用但配置不同 → 默认拒绝，要求 --adopt 明确覆盖当前运行的服务。
+current_plist_path() {
+  launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+    | awk '/path = /{print $3; exit}'
+}
+
+assert_install_safe() {
+  local cur="$1" py="$2" wd="$3"
+  local cpath; cpath="$(current_plist_path)"
+  [ -n "$cpath" ] || return 0                     # 未占用
+
+  if [ "$cpath" != "$PLIST" ]; then
+    die "label '$LABEL' 已被另一个 plist 占用：
+      $cpath
+    直接安装会顶掉它。先停： launchctl bootout gui/$(id -u)/$LABEL"
+  fi
+
+  if [ -f "$PLIST" ]; then
+    local opy owd
+    opy="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || echo '')"
+    owd="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$PLIST" 2>/dev/null || echo '')"
+    if [ "$opy" = "$py" ] && [ "$owd" = "$wd" ]; then
+      return 0                                    # 配置一致，幂等
+    fi
+    if [ "${ADOPT:-0}" -ne 1 ]; then
+      printf '%s !%s 当前已有一个正在运行的服务，配置与本次安装不同：\n' "$Y" "$N"
+      printf '      现有: %s\n            cwd=%s\n' "$opy" "$owd"
+      printf '      本次: %s\n            cwd=%s\n' "$py" "$wd"
+      die "拒绝静默改写在运行的服务。
+    若确实要切换： proteus install --adopt
+    若只想重启现有服务： proteus restart"
+    fi
+  fi
+}
+
+gw_alive() {
+  curl -fsS -m 3 "http://127.0.0.1:8320/healthz" >/dev/null 2>&1
+}
+
+gw_port() {
+  local cfg="$1"
+  python3 - "$cfg" <<'PY' 2>/dev/null || echo 8320
+import json,sys
+try:
+    print(json.load(open(sys.argv[1]))["server"].get("port",8320))
+except Exception:
+    print(8320)
+PY
+}
+
+# ---------------------------------------------------------------- 子命令
+
+cmd_install() {
+  say "安装 launchd 服务"
+  ADOPT=0
+  [ "${1:-}" = "--adopt" ] && ADOPT=1
+  local py wd cfg
+  py="$(find_python)" || die "找不到可用的 Python（需能 import mlx_lm）。
+    先建虚拟环境： python3 -m venv $HERE/.venv && $HERE/.venv/bin/pip install mlx-lm"
+  ok "解释器: $py ($("$py" -V 2>&1))"
+
+  wd="$(find_workdir)"
+  assert_local_workdir "$wd"
+  ok "工作目录: $wd"
+
+  cfg="models.json"
+  [ -f "$wd/$cfg" ] || die "缺少 $wd/$cfg —— 先运行 ./install.sh 生成配置"
+  ok "配置: $cfg"
+
+  # 写盘**之前**先确认这次安装不会静默顶掉一个配置不同的运行中服务。
+  assert_install_safe "" "$py" "$wd"
+
+  write_plist "$py" "$wd" "$cfg"
+  ok "plist 已写入: $PLIST"
+
+  if is_loaded; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    # bootout 是异步的，给 launchd 一点时间释放 label
+    for _ in 1 2 3 4 5; do is_loaded || break; sleep 0.3; done
+  fi
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+    || launchctl load -w "$PLIST" 2>/dev/null \
+    || die "launchd 加载失败：$PLIST"
+  ok "服务已加载（KeepAlive 生效，崩溃自动重启）"
+}
+
+cmd_startup() {
+  if ! is_loaded; then
+    cmd_install
+  fi
+  say "启动网关"
+  # kickstart -k 会先杀再起，保证拿到干净进程
+  launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+
+  printf '    等待网关就绪'
+  local i
+  for i in $(seq 1 60); do
+    if gw_alive; then printf '\n'; ok "网关在线: http://127.0.0.1:8320"; break; fi
+    printf '.'; sleep 1
+  done
+  if ! gw_alive; then
+    printf '\n'
+    warn "网关 60s 内未就绪，日志尾部："
+    tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' || true
+    die "启动失败。排查： proteus doctor"
+  fi
+
+  cmd_gui
+}
+
+cmd_stop() {
+  if is_loaded; then
+    say "停止服务"
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null \
+      || launchctl remove "$LABEL" 2>/dev/null || true
+    ok "已停止（KeepAlive 随卸载失效，不会自动重启）"
+  else
+    warn "服务未加载"
+  fi
+  if pgrep -f "Proteus Studio.app" >/dev/null 2>&1; then
+    say "关闭 GUI"
+    osascript -e 'quit app "Proteus Studio"' >/dev/null 2>&1 || true
+    ok "GUI 已关闭"
+  fi
+}
+
+cmd_restart() {
+  say "重启服务"
+  if is_loaded; then
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  else
+    cmd_install
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  fi
+  local i
+  for i in $(seq 1 60); do
+    gw_alive && { ok "网关在线"; return 0; }
+    sleep 1
+  done
+  warn "未就绪，日志尾部："; tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' || true
+  return 1
+}
+
+cmd_status() {
+  say "服务状态"
+  if is_loaded; then
+    local pid
+    pid="$(launchctl list 2>/dev/null | awk -v L="$LABEL" '$3==L {print $1}')"
+    if [ -n "$pid" ] && [ "$pid" != "-" ]; then
+      ok "launchd: 已加载 (pid $pid)"
+    else
+      warn "launchd: 已加载但无进程（可能正在重启）"
+    fi
+  else
+    warn "launchd: 未加载（运行 proteus startup）"
+  fi
+
+  if gw_alive; then
+    ok "HTTP: 在线"
+    printf '\n'
+    # ⚠️ 两点必须注意，否则整段输出会静默消失（实测踩到）：
+    #   1. 不能用 `python3 -c '...'` —— 单引号内无法转义双引号，
+    #      f-string 里的 m["id"] 会 SyntaxError 并被 2>/dev/null 吞掉。
+    #   2. 更不能用 `curl ... | python3 - <<'PY'` —— heredoc 会占用
+    #      python 的 stdin，管道数据被丢弃，json.load 读到空输入。
+    # 因此让 Python 自己发请求（stdlib urllib，无额外依赖）。
+    python3 - <<'PY' 2>/dev/null || true
+import json, urllib.request
+
+def get(path):
+    with urllib.request.urlopen("http://127.0.0.1:8320" + path, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+try:
+    d = get("/v1/models")
+    print("  模型:")
+    for m in d.get("data", []):
+        a = ", ".join(m.get("aliases") or []) or "-"
+        print(f"    - {m['id']:<16} (aliases: {a})")
+    print()
+except Exception as exc:
+    print(f"  (模型列表不可用: {exc})")
+
+try:
+    s = get("/stats")
+    print(f"  运行时长: {s.get('uptime_s', 0)/3600:.1f} 小时")
+    print(f"  已加载  : {s.get('loaded')}")
+    for k, v in (s.get("speculative") or {}).items():
+        if v.get("active"):
+            print(f"  投机解码: {k} 启用 "
+                  f"(draft={v.get('draft_model')}, rule={v.get('accept_rule')}, "
+                  f"nd={v.get('num_draft_tokens')})")
+    m = s.get("last_meta")
+    if m:
+        print(f"  最近请求: {m.get('completion_tokens')} tok, "
+              f"{m.get('tps')} tok/s, ttft {m.get('ttft_s')}s")
+except Exception as exc:
+    print(f"  (统计不可用: {exc})")
+PY
+  else
+    warn "HTTP: 离线"
+  fi
+
+  printf '\n'
+  if pgrep -f "Proteus Studio.app" >/dev/null 2>&1; then
+    ok "GUI: 运行中"
+  else
+    warn "GUI: 未运行（proteus gui 打开）"
+  fi
+}
+
+cmd_logs() {
+  [ -f "$LOG" ] || die "日志不存在: ${LOG}（服务还没跑过？）"
+  if [ "${1:-}" = "-f" ]; then
+    say "跟踪 $LOG （Ctrl-C 退出）"
+    tail -f "$LOG"
+  else
+    say "日志尾部 $LOG"
+    tail -60 "$LOG"
+  fi
+}
+
+cmd_gui() {
+  if [ ! -d "$GUI_APP" ]; then
+    warn "未找到 $GUI_APP"
+    echo "    构建： cd $HERE/ProteusStudio && xcodegen generate && xcodebuild -scheme ProteusStudio -configuration Release build"
+    return 0
+  fi
+  if pgrep -f "Proteus Studio.app" >/dev/null 2>&1; then
+    ok "GUI 已在运行"
+    open "$GUI_APP" 2>/dev/null || true
+    return 0
+  fi
+  say "打开 GUI"
+  open "$GUI_APP" && ok "Proteus Studio 已启动"
+}
+
+cmd_uninstall() {
+  cmd_stop >/dev/null 2>&1 || true
+  if [ -f "$PLIST" ]; then
+    rm -f "$PLIST"; ok "已删除 $PLIST"
+  else
+    warn "plist 不存在"
+  fi
+}
+
+cmd_doctor() {
+  local bad=0
+  say "环境自检"
+
+  # Python
+  local py
+  if py="$(find_python)"; then
+    ok "Python: $py ($("$py" -V 2>&1))"
+    if "$py" -c 'import mlx' 2>/dev/null; then ok "  mlx 可导入"; else warn "  mlx 不可导入"; bad=1; fi
+    if "$py" -c 'import mlx_lm' 2>/dev/null; then ok "  mlx_lm 可导入"; else warn "  mlx_lm 不可导入"; bad=1; fi
+  else
+    warn "找不到能 import mlx_lm 的 Python"; bad=1
+  fi
+
+  # 工作目录本地性
+  local wd; wd="$(find_workdir)"
+  case "$wd" in
+    *"Mobile Documents"*|*"com~apple~CloudDocs"*)
+      warn "工作目录在 iCloud（${wd}）—— 会导致 EDEADLK 死锁"; bad=1 ;;
+    *) ok "工作目录在本地盘: $wd" ;;
+  esac
+
+  # 配置
+  [ -f "$wd/models.json" ] && ok "models.json 存在" || { warn "models.json 缺失（跑 ./install.sh）"; bad=1; }
+
+  # 模型权重
+  if [ -f "$wd/models.json" ]; then
+    python3 - "$wd/models.json" <<'PY' 2>/dev/null || true
+import json,sys,os
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    print("  ! models.json 解析失败"); raise SystemExit
+for m in d.get("models",[]):
+    p=os.path.expanduser(m.get("path",""))
+    print(("   ✓ " if os.path.isdir(p) else "   ! 缺失 ")+f"{m['name']}: {p}")
+PY
+  fi
+
+  # plist 一致性（历史事故点）
+  if [ -f "$PLIST" ]; then
+    local ppy pwd_
+    ppy="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || echo '?')"
+    pwd_="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$PLIST" 2>/dev/null || echo '?')"
+    ok "plist 解释器: $ppy"
+    case "$pwd_" in
+      *"Mobile Documents"*) warn "plist 工作目录在 iCloud: $pwd_"; bad=1 ;;
+      *) ok "plist 工作目录: $pwd_" ;;
+    esac
+  else
+    warn "plist 未安装（proteus install）"
+  fi
+
+  # 端口占用
+  if gw_alive; then ok "网关在线: http://127.0.0.1:8320"
+  elif curl -fsS -m 2 http://127.0.0.1:8320/ >/dev/null 2>&1; then warn "8320 被非本网关进程占用"
+  else ok "8320 空闲"; fi
+
+  printf '\n'
+  [ "$bad" -eq 0 ] && ok "未发现问题" || warn "存在问题（见上）"
+  return 0
+}
+
+usage() {
+  sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  startup|start|up)   cmd_startup ;;
+  stop|down)          cmd_stop ;;
+  restart)            cmd_restart ;;
+  status|st)          cmd_status ;;
+  logs|log)           shift; cmd_logs "${1:-}" ;;
+  gui)                cmd_gui ;;
+  install)            cmd_install ;;
+  uninstall)          cmd_uninstall ;;
+  doctor|check)       cmd_doctor ;;
+  ""|-h|--help|help)  usage ;;
+  *)                  printf '未知子命令: %s\n\n' "$1" >&2; usage; exit 1 ;;
+esac
