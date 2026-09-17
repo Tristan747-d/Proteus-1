@@ -323,6 +323,32 @@ struct MessageRow: View {
                         .foregroundStyle(.secondary)
                 }
 
+                // 附件标签：让用户确认「这条消息到底带了什么」。
+                // 只显示文件名与大小 —— 内容不进气泡，否则长文件会把界面撑爆。
+                if !message.attachmentNames.isEmpty {
+                    VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
+                        ForEach(message.attachmentNames, id: \.self) { n in
+                            HStack(spacing: 5) {
+                                Image(systemName: "paperclip")
+                                    .font(.system(size: 9))
+                                Text(n)
+                                    .font(.system(size: 10.5))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background {
+                                Capsule().fill(isUser
+                                    ? Color.white.opacity(0.18)
+                                    : Color.accentColor.opacity(0.12))
+                            }
+                            .foregroundStyle(isUser ? Color.white.opacity(0.95)
+                                                    : Color.accentColor)
+                        }
+                    }
+                }
+
                 Group {
                     if streaming && message.text.isEmpty {
                         TypingIndicator()

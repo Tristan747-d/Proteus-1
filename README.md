@@ -16,6 +16,7 @@ work on the Apple Neural Engine — see [`docs/`](docs/) for the full record.
 | **OpenAI-compatible API** | `POST /v1/chat/completions` with SSE streaming. Any agent client that supports a custom `base_url` can connect — no changes needed. |
 | **Two execution schemes** | **Proteus-1** (speculative decoding + prefix cache + int8 KV) and **GPU** (the bare MLX baseline), switchable per request. |
 | **Model onboarding** | `gm-probe` inspects a model, finds a compatible draft, verifies tokenizer compatibility, and measures the best `n_draft` — in one command. |
+| **Attachments** | Send text, code, CSV/JSON, PDF or docx alongside a message. Extraction happens **gateway-side**, so any OpenAI-compatible client gets it. |
 | **Native GUI** | SwiftUI app: chat with message bubbles and live metrics, model setup, and a service page showing how external clients connect. |
 
 **Measured on M5 / 16 GB** — decode throughput, `proteus-1` vs `gpu-baseline`:
@@ -111,6 +112,45 @@ Changing the port at install time:
 PROTEUS_PORT=9000 ./install.sh
 ```
 
+### Attachments
+
+In the app, the paperclip button attaches files to your next message. You can
+also send them from any client, since extraction is done **by the gateway**:
+
+```python
+import base64
+data = base64.b64encode(open("report.pdf", "rb").read()).decode()
+c.chat.completions.create(model="default", messages=[{
+    "role": "user",
+    "content": [
+        {"type": "text", "text": "Summarise this."},
+        {"type": "file", "file": {"name": "report.pdf", "data": data}},
+    ],
+}])
+```
+
+| Type | How it is handled |
+|---|---|
+| Text, code, CSV, JSON, YAML, Markdown, XML, HTML, … | Read directly (UTF-8, with GB18030/Big5 fallback) |
+| `docx`, `doc`, `rtf`, `odt` | `textutil` (built into macOS — no extra dependency) |
+| `pdf` | `pypdf` if installed, else a clear error telling you to install it |
+| Anything else | Rejected **with a reason** — never silently dropped |
+
+Limits: 20 MB per file, 16 000 characters per attachment and 24 000 characters
+total per request. When a limit truncates content, the prompt says so
+explicitly rather than quietly cutting your document in half.
+
+> ⚠️ **This needs a text-capable model.** `Llama-3.1-8B-Instruct-4bit` has no
+> vision, so images are refused rather than silently ignored. For images you
+> would need a vision model (e.g. a Qwen-VL build) served by the same gateway.
+
+Install PDF support into the gateway's interpreter:
+
+```bash
+$(dirname $(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' \
+  ~/Library/LaunchAgents/com.tristan.gm.gateway.plist))"/pip" install pypdf
+```
+
 The gateway runs as a **launchd** service, so `KeepAlive` restarts it if it
 crashes, and it starts at login. `proteus install` refuses to silently
 overwrite a running service whose configuration differs — pass `--adopt` to
@@ -169,6 +209,7 @@ gm/                    gateway (Python, stdlib HTTP + mlx-lm in-process)
     mlx_lm_backend.py    the workhorse
     spec_rejection.py    rejection-sampling speculative loop
     prefix_cache.py      cross-request KV reuse
+  attachments.py         attachment text extraction (pdf/docx/text)
   autotune.py            model inspection + draft matching
   probe_cli.py           gm-probe implementation
 ProteusStudio/         macOS app (SwiftUI)

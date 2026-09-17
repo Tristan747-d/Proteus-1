@@ -211,7 +211,7 @@ actor GMGateway {
     /// stop 是一个 closure，返回 true 时中止读取（关连接让网关感知取消）。
     nonisolated func stream(
         model: String,
-        messages: [[String: String]],
+        messages: [[String: Any]],
         temperature: Double,
         maxTokens: Int,
         session sessionID: String?,
@@ -231,9 +231,25 @@ actor GMGateway {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 900
         let (bytes, resp) = try await URLSession(configuration: cfg).bytes(for: r)
-        guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
-            throw GatewayError.http((resp as? HTTPURLResponse)?.statusCode ?? -1,
-                                    "流式请求失败")
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else {
+            // ⚠️ 必须把网关的错误正文读出来。附件被拒（400）时网关会在 body
+            // 里写明原因（例如「不支持的文件类型：.png」）；旧实现只丢一句
+            // 笼统的 "流式请求失败"，用户根本不知道附件哪里出了问题。
+            var detail = "流式请求失败"
+            var buf = Data()
+            for try await b in bytes {
+                buf.append(b)
+                if buf.count > 8192 { break }
+            }
+            if let obj = try? JSONSerialization.jsonObject(with: buf) as? [String: Any],
+               let err = obj["error"] as? [String: Any],
+               let msg = err["message"] as? String, !msg.isEmpty {
+                detail = msg
+            } else if let s = String(data: buf, encoding: .utf8), !s.isEmpty {
+                detail = String(s.prefix(400))
+            }
+            throw GatewayError.http(status, detail)
         }
 
         var full = ""

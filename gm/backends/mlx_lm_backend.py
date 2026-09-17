@@ -771,7 +771,14 @@ def _normalize_ids(tok, text: str) -> list:
 
 
 def _flatten_message(m: dict) -> dict:
-    """OpenAI message 兼容：content 可为 str 或 [{type:text,text:...}, ...]。"""
+    """OpenAI message 兼容：content 可为 str 或 content parts 数组。
+
+    ⚠️ 附件（{"type": "file"}）在这里提取成文本注入。
+    旧实现对非 text 的 part 是**静默跳过** —— 用户附一个 PDF 或一张图，
+    模型什么都没收到，而且没有任何报错，用户只会觉得「模型没看我的文件」。
+    现在改为：能提取就提取，不能提取就抛 AttachmentError，由 server 层
+    转成 400 并把原因回给客户端。
+    """
     role = m.get("role", "user")
     content = m.get("content", "")
     if isinstance(content, str):
@@ -782,6 +789,12 @@ def _flatten_message(m: dict) -> dict:
             if isinstance(p, dict) and p.get("type") == "text":
                 parts.append(str(p.get("text", "")))
         text = "\n".join(parts)
+
+        from ..attachments import build_attachment_block
+
+        block = build_attachment_block(content)
+        if block:
+            text = f"{text}\n\n{block}" if text else block
     else:
         text = str(content)
     return {"role": role, "content": text}

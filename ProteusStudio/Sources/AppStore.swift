@@ -17,6 +17,9 @@ struct ChatMessage: Identifiable, Equatable {
     var ttft: Double?
     var elapsed: Double?
     var charsPerSec: Double?
+    /// 该条消息附带的文件名（仅用于展示气泡上的附件标签）。
+    /// 不存内容 —— 附件数据只在发送那一刻存在于 payload 里。
+    var attachmentNames: [String] = []
 
     enum Role { case user, assistant, system }
 }
