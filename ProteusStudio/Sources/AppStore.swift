@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 // MARK: - 数据模型
 
@@ -68,8 +69,32 @@ final class AppStore: ObservableObject {
     let chat = ChatEngine()
     let gateway = GMGateway()
 
+    // ⚠️ 关键：`chat` 是嵌套的 ObservableObject，SwiftUI **不会**自动观察它。
+    // 症状（用户实测报障）：发一条消息后界面毫无反应，切到别的标签页再切回来
+    // 才突然看到全部输出。
+    //
+    // 原因：View 里写的是 `store.chat.messages`。`store` 变化会触发重绘，但
+    // `chat` 的 @Published 变化与 `store.objectWillChange` 没有任何关系 ——
+    // AppStore 这个 ObservableObject 根本不知道 chat 变了。于是流式 token
+    // 一直在写进 chat.liveText，View 却从不重绘；只有切换到别的 tab 导致
+    // RootView 重新求值（整个 detail 分支重建），才顺便读到最新值。
+    //
+    // 修法：把 chat 的 objectWillChange 转发给 AppStore，使任何 chat 变化
+    // 都上升为 store 变化，从而触发依赖 store 的 View 重绘。
+    private var cancellables = Set<AnyCancellable>()
+
     init() {
         selectedScheme = schemes[0]
+        chat.objectWillChange
+            .sink { [weak self] _ in
+                // 转发到下一轮 runloop：objectWillChange 在变更**之前**发出，
+                // 若同步转发，View 求值时 @Published 尚未写入新值，会渲染成
+                // 旧内容。延迟一拍可保证读到的是变更后的值。
+                DispatchQueue.main.async {
+                    self?.objectWillChange.send()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     func refresh() async {
