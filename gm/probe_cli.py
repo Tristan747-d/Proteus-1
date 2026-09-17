@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
@@ -243,9 +244,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"扫描失败（不影响探测结果）: {exc}", file=sys.stderr, flush=True)
 
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     else:
-        print(autotune.format_report(report))
+        # ⚠️ format_report 的输出必须 flush：GUI 把 stdout 与 stderr 合到同一个
+        # 管道读，而 stdout 被重定向时是**块缓冲**、stderr 是无缓冲。不 flush
+        # 的话，写在后面的 stderr 错误会**先于**整篇报告出现 —— 用户看到错误
+        # 在报告之前，甚至以为报告没跑完（实测）。
+        print(autotune.format_report(report), flush=True)
         if "nd_sweep" in report:
             meta = report.get("nd_sweep_meta", {})
             print(f"\n--- n_draft 实测扫描（{meta.get('method', '?')}）---")
@@ -300,12 +305,45 @@ def main(argv: list[str] | None = None) -> int:
                 break
         else:
             models.append(entry)
-        bak = cfg.with_suffix(f".json.bak.{time.strftime('%Y%m%d_%H%M%S')}")
-        shutil.copy2(cfg, bak)
-        cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\n已写入 {cfg}")
-        print(f"备份   {bak}")
-        print("重启网关生效: launchctl kickstart -k gui/$(id -u)/com.tristan.gm.gateway")
+
+        # ⚠️ 整个写入过程必须显式捕获异常并**报告**。
+        # 现象（2026-09-17 实测）：models.json 若归 root 所有（早期用 sudo
+        # 装过就会这样），cfg.write_text 抛 PermissionError，但该异常一路
+        # 冒到解释器，而 GUI 只看到退出码 1、**没有任何输出** ——
+        # 既不知道失败了，也不知道为什么。备份文件还会一次次堆积。
+        #
+        # 现在：① 写前先探测可写性并给出可操作的修复命令；
+        #       ② 备份只在确实可写时才做，不再留下垃圾；
+        #       ③ 任何失败都打印明确原因。
+        if not os.access(cfg, os.W_OK):
+            owner = ""
+            try:
+                import pwd
+                owner = pwd.getpwuid(cfg.stat().st_uid).pw_name
+            except Exception:
+                pass
+            print(f"\n写入失败：{cfg} 不可写"
+                  + (f"（归 {owner} 所有）" if owner else ""), file=sys.stderr)
+            print("修复归属（执行一次即可）：", file=sys.stderr)
+            print(f"    sudo chown $(id -un) \"{cfg}\"", file=sys.stderr)
+            if cfg.parent.exists() and not os.access(cfg.parent, os.W_OK):
+                print(f"    # 目录也不可写： sudo chown $(id -un) \"{cfg.parent}\"",
+                      file=sys.stderr)
+            return 1
+
+        try:
+            bak = cfg.with_suffix(f".json.bak.{time.strftime('%Y%m%d_%H%M%S')}")
+            shutil.copy2(cfg, bak)
+            cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+        except Exception as exc:
+            print(f"\n写入失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"目标：{cfg}", file=sys.stderr)
+            return 1
+        print(f"\n已写入 {cfg}", flush=True)
+        print(f"备份   {bak}", flush=True)
+        print("重启网关生效: launchctl kickstart -k gui/$(id -u)/com.tristan.gm.gateway",
+              flush=True)
     return 0
 
 

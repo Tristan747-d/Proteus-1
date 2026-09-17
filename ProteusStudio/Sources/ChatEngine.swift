@@ -19,6 +19,20 @@ final class ChatEngine: ObservableObject {
 
     var isEmpty: Bool { messages.isEmpty && liveText.isEmpty }
 
+    /// 已完成的对话轮数。
+    ///
+    /// 定义：一个「用户提问 + 助手回答」算一轮，只数**已落库**的助手消息。
+    /// 正在流式生成的那条不计入 —— 否则数字会在生成期间提前 +1，看起来像
+    /// 统计错了。被用户中断的（"（已停止）"）也算一轮，因为它确实发生了。
+    ///
+    /// 用 assistant 消息数而不是 messages.count/2：后者在用户消息已入库、
+    /// 助手还没回时会算出小数般的偏差，且中断、出错等情况都会失真。
+    var turnCount: Int {
+        messages.reduce(0) { acc, m in
+            m.role == .assistant ? acc + 1 : acc
+        }
+    }
+
     func reset() {
         stop()
         messages = []

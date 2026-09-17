@@ -213,8 +213,24 @@ struct SetupView: View {
         let out = runPython(["-m", "gm.probe_cli", path, "--write", "--name", n],
                             cwd: root)
         report += "\n\n" + out.text
-        verdict = out.text.contains("已写入") ? "已写入配置" : "写入失败"
-        verdictKind = out.text.contains("已写入") ? .good : .bad
+
+        // 判定要用**退出码**，不能只看文本里有没有「已写入」。
+        // 旧实现在失败时（例如 models.json 归 root 所有、不可写）留下的是
+        // 一句 stderr 警告，界面只笼统显示「写入失败」而不知道原因，用户
+        // 也无从下手。现在把 CLI 给出的可操作提示直接转述出来。
+        if out.code == 0, out.text.contains("已写入") {
+            verdict = "已写入配置"
+            verdictKind = .good
+        } else if out.text.contains("不可写") {
+            verdict = "写入失败：配置文件不可写（可能是 root 所有）—— 详见下方"
+            verdictKind = .bad
+        } else if out.text.contains("不支持投机解码加速") {
+            verdict = "未写入：该模型不支持投机加速（详见下方原因）"
+            verdictKind = .bad
+        } else {
+            verdict = "写入失败（退出码 \(out.code)）—— 详见下方输出"
+            verdictKind = .bad
+        }
         Task { await store.refresh() }
     }
 }
@@ -230,10 +246,52 @@ struct ProcResult { let text: String; let code: Int32 }
 /// 读到 EOF 才返回，此时子进程已写完），再 waitUntilExit。
 ///
 /// 另外：本函数本身是阻塞的，调用方必须在后台线程里跑。
+///
+/// ⚠️ 解释器必须与网关**同一个**。原先写死 `/usr/bin/env python3`，在 PATH
+/// 里解析到的是系统 Python（本机 3.14），而 mlx_lm 装在网关的 venv 里 ——
+/// 于是探测要么 import 失败、要么行为与网关不一致。这里按优先级找第一个
+/// 真能 `import mlx_lm` 的解释器；找不到就退回 `/usr/bin/env python3`，
+/// 让调用方从输出里看到 import 错误，而不是静默拿到错误结果。
+func resolveProbePython() -> String {
+    let fm = FileManager.default
+    var candidates: [String] = []
+    // 1) 网关服务实际用的解释器（launchd plist 是权威来源）
+    let plist = NSHomeDirectory() + "/Library/LaunchAgents/com.tristan.gm.gateway.plist"
+    if let d = fm.contents(atPath: plist),
+       let s = String(data: d, encoding: .utf8) {
+        // 取 <array> 里第一个 <string>，即 ProgramArguments[0]
+        let parts = s.components(separatedBy: "<string>")
+        if parts.count > 1 {
+            let v = parts[1].components(separatedBy: "</string>")[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if v.hasPrefix("/") { candidates.append(v) }
+        }
+    }
+    // 2) 常见 venv 位置
+    let home = NSHomeDirectory()
+    candidates.append(home + "/Proteus-Release/.venv/bin/python")
+    candidates.append(home + "/GeneralModel/.venv/bin/python")
+    candidates.append(home + "/ANEProbe/P6Model/phase4/.venv/bin/python")
+    // 3) PATH 上的 python3
+    candidates.append("/usr/bin/env")
+
+    for c in candidates {
+        if c == "/usr/bin/env" { return c }
+        if fm.isExecutableFile(atPath: c) { return c }
+    }
+    return "/usr/bin/env python3"
+}
+
 func runPython(_ args: [String], cwd: String) -> ProcResult {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["python3"] + args
+    let py = resolveProbePython()
+    if py == "/usr/bin/env" {
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = ["python3"] + args
+    } else {
+        p.executableURL = URL(fileURLWithPath: py)
+        p.arguments = args
+    }
     p.currentDirectoryURL = URL(fileURLWithPath: cwd)
     let pipe = Pipe()
     p.standardOutput = pipe

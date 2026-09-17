@@ -150,6 +150,12 @@ struct StatsStrip: View {
 
     var body: some View {
         HStack(spacing: 14) {
+            // 对话轮数 —— 只统计**已完成的问答对**（用户一条 + 助手一条）。
+            // 正在生成中的那条不算，否则数字会在流式期间来回跳。
+            MetricChip(icon: "bubble.left.and.bubble.right",
+                       value: "\(store.chat.turnCount)",
+                       unit: "轮")
+
             if store.stats.tps > 0 {
                 MetricChip(icon: "speedometer", value: String(format: "%.1f", store.stats.tps),
                            unit: "tok/s")
@@ -165,6 +171,7 @@ struct StatsStrip: View {
             }
         }
         .animation(.default, value: store.stats)
+        .animation(.default, value: store.chat.turnCount)
     }
 }
 
