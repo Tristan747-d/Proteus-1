@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# ---- 本地配置（含绝对路径，不入库）----
+models.json
+models.json.bak*
+*.local.json
+
+# ---- 构建产物 ----
+ProteusStudio/*.xcodeproj/
+ProteusStudio/build/
+build/
+DerivedData/
+*.app
+
+# ---- macOS ----
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+
+# ---- 日志与临时 ----
+*.log
+/tmp/

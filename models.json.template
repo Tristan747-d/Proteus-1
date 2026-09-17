@@ -1,0 +1,60 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8320,
+    "max_resident": 1
+  },
+  "models": [
+    {
+      "name": "proteus-1",
+      "aliases": ["default", "general", "proteus1"],
+      "runtime": "mlx_lm",
+      "path": "@MODEL_DIR@",
+      "context": {
+        "max_prompt_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "speculative": {
+          "enabled": true,
+          "draft_model": "@DRAFT_MODEL@",
+          "num_draft_tokens": 3,
+          "num_draft_tokens_high_temp": 2,
+          "max_temp": 0.5,
+          "accept_rule": "rejection"
+        },
+        "prefix_cache": {
+          "enabled": true,
+          "max_sessions": 8,
+          "shared": false,
+          "kv_bits": 8,
+          "kv_group_size": 64,
+          "max_total_tokens": 32768
+        }
+      }
+    },
+    {
+      "name": "gpu-baseline",
+      "aliases": ["gpu", "raw"],
+      "runtime": "mlx_lm",
+      "path": "@MODEL_DIR@",
+      "context": {
+        "max_prompt_tokens": 32768,
+        "max_output_tokens": 4096
+      },
+      "params": {
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "speculative": {
+          "enabled": false
+        },
+        "prefix_cache": {
+          "enabled": false,
+          "kv_bits": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+name: ProteusStudio
+options:
+  bundleIdPrefix: com.tristan.gm
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  xcodeVersion: "27.0"
+
+targets:
+  ProteusStudio:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_NAME: Proteus Studio
+        PRODUCT_BUNDLE_IDENTIFIER: com.tristan.proteus.studio
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_VERSION: "5.10"
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: "NO"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Proteus Studio
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.developer-tools"
+        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: "YES"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Tristan"
+        COMBINE_HIDPI_IMAGES: "YES"
