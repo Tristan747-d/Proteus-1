@@ -41,6 +41,15 @@ if ! "$PY" -c "import mlx_lm" 2>/dev/null; then
 else
   ok "mlx-lm 已安装"
   MLX_OK=1
+
+  # 附件功能：pypdf 只在处理 PDF 时才需要，缺失不影响其它类型
+  # （docx/rtf/html 走 macOS 自带的 textutil）。因此这里只提示，不报错。
+  if "$PY" -c "import pypdf" 2>/dev/null; then
+    ok "pypdf 已安装（支持 PDF 附件）"
+  else
+    warn "未安装 pypdf —— PDF 附件将无法解析（其它类型不受影响）"
+    echo "    需要时运行： $PY -m pip install pypdf"
+  fi
 fi
 
 if ! uname -m | grep -q arm64; then
